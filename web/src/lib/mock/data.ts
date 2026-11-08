@@ -3008,6 +3008,8 @@ export const audit: Audit = {
 export const llmProfiles: LLMProfile[] = [
   {
     id: "1",
+    provider_id: "1",
+    provider_name: "Anthropic",
     name: "Claude Opus 4.8",
     format: "anthropic",
     model: "claude-opus-4-8",
@@ -3026,6 +3028,8 @@ export const llmProfiles: LLMProfile[] = [
   },
   {
     id: "2",
+    provider_id: "2",
+    provider_name: "DeepSeek",
     name: "DeepSeek V4",
     format: "openai",
     base_url: "https://api.deepseek.com",
@@ -3042,6 +3046,27 @@ export const llmProfiles: LLMProfile[] = [
     // openai 格式 + 推理模型：上限走 max_completion_tokens。
     max_tokens: 8192,
     max_tokens_field: "max_completion_tokens",
+  },
+  {
+    id: "3",
+    provider_id: "2",
+    provider_name: "DeepSeek",
+    name: "DeepSeek Reasoner",
+    format: "openai",
+    base_url: "https://api.deepseek.com",
+    model: "deepseek-reasoner",
+    api_key_hint: "…9c11",
+    rate_per_second: 0,
+    rate_per_minute: 60,
+    context_window_k: 128,
+    thinking_type: "enabled",
+    reasoning_effort: "high",
+    is_default: false,
+    priority: 5,
+    pool_exclude: false,
+    max_tokens: 8192,
+    max_tokens_field: "max_completion_tokens",
+    streaming: true,
   },
 ];
 

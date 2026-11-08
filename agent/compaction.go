@@ -332,6 +332,9 @@ func (c *Compactor) finish(expID int64) {
 
 // loadColdGraph reads the exploration's nodes + edges and builds the cold-graph
 // view plus an id→node index (for summaries/payload during compression).
+// The situational snapshot must not call this: it only needs the hot set, and
+// loadColdGraphLight reads that without the evidence bodies. Compaction keeps
+// this path because the digest text is written from those bodies.
 func loadColdGraph(ts *db.ExplorationStore) (*coldGraph, map[int64]*db.Node, error) {
 	// Compaction must see the WHOLE graph, not the default row caps — pass a very
 	// high limit so the LIMIT clause is effectively unbounded for real task sizes.
@@ -355,6 +358,26 @@ func loadColdGraph(ts *db.ExplorationStore) (*coldGraph, map[int64]*db.Node, err
 		cgEdges = append(cgEdges, cgEdge{From: e.From, Rel: e.Rel, To: e.To})
 	}
 	return newColdGraph(cgNodes, cgEdges), byID, nil
+}
+
+// loadColdGraphLight builds the fold/revival view without node payloads.
+// The snapshot and each inherited-task view use it to decide which covered
+// members are hot again. A missing edge would fold a live chain, so the read
+// is the whole graph, just not the bodies. Compaction stays on loadColdGraph.
+func loadColdGraphLight(ts *db.ExplorationStore) (*coldGraph, error) {
+	nodes, edges, err := ts.LightGraph()
+	if err != nil {
+		return nil, err
+	}
+	cgNodes := make([]cgNode, len(nodes))
+	for i, n := range nodes {
+		cgNodes[i] = cgNode{ID: n.ID, Kind: n.Kind, State: n.State}
+	}
+	cgEdges := make([]cgEdge, len(edges))
+	for i, e := range edges {
+		cgEdges[i] = cgEdge{From: e.From, Rel: e.Rel, To: e.To}
+	}
+	return newColdGraph(cgNodes, cgEdges), nil
 }
 
 func toDBStampOps(ops []stampOp) []db.StampOp {

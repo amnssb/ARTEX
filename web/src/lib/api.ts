@@ -54,8 +54,10 @@ import type {
   InterceptRule,
   JudgeConfig,
   JudgeUsage,
+  LLMModelInput,
   LLMPoolStatus,
   LLMProfile,
+  LLMProvider,
   LLMRecordDetail,
   LLMRecordItem,
   LLMRetryOverride,
@@ -825,8 +827,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -930,32 +931,40 @@ export const api = {
     proxy = "",
     context_window_k = 0,
   ) => post("/llm", { provider, model, base_url, proxy, api_key, rate_per_second, rate_per_minute, context_window_k }),
-  testLLM: (
-    provider: string,
-    model: string,
-    base_url: string,
-    api_key: string,
-    proxy = "",
-    thinking_type = "",
-    reasoning_effort = "",
-    profile_id?: number,
-    streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
-    session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
-  ) =>
+  testLLM: (input: {
+    provider: string;
+    model: string;
+    base_url?: string;
+    api_key?: string;
+    proxy?: string;
+    thinking_type?: string;
+    reasoning_effort?: string;
+    profile_id?: number;
+    provider_id?: number;
+    streaming?: boolean; // 用该模型真实的收发模式来测
+    session_header_key?: string;
+  }) =>
     // reply = 模型实际回复(已截断);一个字都不回的配置后端直接判失败
-    post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
-      provider,
-      model,
-      base_url,
-      proxy,
-      api_key,
-      thinking_type,
-      reasoning_effort,
-      profile_id,
-      streaming,
-      session_header_key,
-    }),
+    post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", input),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
+  llmProviders: () => get<{ providers: LLMProvider[] }>("/llm/providers").then((r) => arr(r.providers)),
+  saveLLMProvider: (p: {
+    id?: number; // 省略 = 新建，此时 models 至少要有一个
+    name: string;
+    format: string;
+    base_url?: string;
+    proxy?: string;
+    api_key?: string; // 更新时留空 = 保持原密钥
+    rate_per_second?: number;
+    rate_per_minute?: number;
+    session_header_key?: string;
+    retry?: LLMRetryOverride;
+    models?: LLMModelInput[];
+  }) => post<{ id: number; model_ids?: number[] }>("/llm/providers", p),
+  deleteLLMProvider: (id: string) => del<{ deleted: number }>(`/llm/providers/${id}`),
+  addLLMModels: (providerId: string, models: LLMModelInput[]) =>
+    post<{ ids: number[]; skipped: number }>(`/llm/providers/${providerId}/models`, { models }),
+  updateLLMModel: (id: string, m: LLMModelInput) => patch<{ id: number }>(`/llm/profiles/${id}`, m),
   saveLLMProfile: (p: {
     id?: number; // omit/0 = create; set = update that profile
     name: string;
@@ -986,14 +995,14 @@ export const api = {
   // 全局重试策略（五层各自的次数+间隔）。全 0 = 全部走内置默认。
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
-  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
-    post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
-      provider,
-      base_url,
-      api_key,
-      proxy,
-      profile_id,
-    }),
+  fetchLLMModels: (input: {
+    provider: string;
+    base_url?: string;
+    api_key?: string;
+    proxy?: string;
+    profile_id?: number;
+    provider_id?: number; // 密钥留空时用提供商已存的那把
+  }) => post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", input),
 
   // ---- agents ----
   agents: () => get<{ agents: Agent[] }>("/agents").then((r) => arr(r.agents)),

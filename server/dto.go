@@ -617,10 +617,13 @@ type LLMProfileDTO struct {
 	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
 	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
 	Retry db.RetryOverride `json:"retry"`
+	// 所属提供商。任务和 Agent 仍绑定上面的模型 id，提供商只是共用的连接。
+	ProviderID   string `json:"provider_id,omitempty"`
+	ProviderName string `json:"provider_name,omitempty"`
 }
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
-	return LLMProfileDTO{
+	dto := LLMProfileDTO{
 		ID:               i64s(p.ID),
 		Name:             p.Name,
 		Format:           p.Format,
@@ -642,6 +645,54 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		SessionHeaderKey: p.SessionHeaderKey,
 		Retry:            p.Retry,
 	}
+	if p.ProviderID > 0 {
+		dto.ProviderID = i64s(p.ProviderID)
+		dto.ProviderName = p.ProviderName
+	}
+	return dto
+}
+
+// LLMProviderDTO is one endpoint plus the models that share its key and address.
+type LLMProviderDTO struct {
+	ID               string           `json:"id"`
+	Name             string           `json:"name"`
+	Format           string           `json:"format"`
+	BaseURL          string           `json:"base_url,omitempty"`
+	Proxy            string           `json:"proxy,omitempty"`
+	APIKeyHint       string           `json:"api_key_hint,omitempty"`
+	RatePerSecond    float64          `json:"rate_per_second"`
+	RatePerMinute    float64          `json:"rate_per_minute"`
+	SessionHeaderKey string           `json:"session_header_key"`
+	Retry            db.RetryOverride `json:"retry"`
+	Models           []LLMProfileDTO  `json:"models"`
+}
+
+func llmProviderDTO(p *db.LLMProvider) LLMProviderDTO {
+	models := make([]LLMProfileDTO, 0, len(p.Models))
+	for _, m := range p.Models {
+		models = append(models, llmProfileDTO(m))
+	}
+	return LLMProviderDTO{
+		ID:               i64s(p.ID),
+		Name:             p.Name,
+		Format:           p.Format,
+		BaseURL:          p.BaseURL,
+		Proxy:            p.Proxy,
+		APIKeyHint:       p.APIKeyHint,
+		RatePerSecond:    p.RatePerSecond,
+		RatePerMinute:    p.RatePerMinute,
+		SessionHeaderKey: p.SessionHeaderKey,
+		Retry:            p.Retry,
+		Models:           models,
+	}
+}
+
+func llmProviderDTOs(in []*db.LLMProvider) []LLMProviderDTO {
+	out := make([]LLMProviderDTO, 0, len(in))
+	for _, p := range in {
+		out = append(out, llmProviderDTO(p))
+	}
+	return out
 }
 
 func llmProfileDTOs(in []*db.LLMProfile) []LLMProfileDTO {

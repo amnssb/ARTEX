@@ -21,6 +21,37 @@ context_tasks AS (
   WHERE relation.task_id=$1
 )`
 
+// contextAssetsCTE is the asset set shared by the host list and the host
+// count: assets attached to the current task or a direct source, assets
+// anchored on those explorations, and assets inside either task's scope.
+// Counting hosts must use this same set. The narrower task_ids-only read
+// drops inherited hosts and scope-attributed hosts.
+const contextAssetsCTE = directTaskContextCTE + `,
+context_assets AS (
+  SELECT DISTINCT a.id
+  FROM assets a
+  WHERE EXISTS (SELECT 1 FROM context_tasks ctx WHERE ctx.task_id=ANY(a.task_ids))
+  UNION
+  SELECT ea.asset_id
+  FROM exploration_anchors ea
+  JOIN exploration_nodes en ON en.id=ea.node_id
+  JOIN context_tasks ctx ON ctx.exploration_id=en.exploration_id
+  UNION
+  SELECT DISTINCT a.id
+  FROM assets a
+  JOIN task_scope ts ON (
+       (ts.kind='company'     AND a.company_id=ts.company_id)
+    OR (ts.kind='root_domain' AND a.root_domain=ts.domain)
+    OR (ts.kind='subdomain'   AND a.domain=ts.domain)
+    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
+    OR (ts.kind='icp' AND (
+         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
+         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
+       ))
+  )
+  JOIN context_tasks ctx ON ctx.task_id=ts.task_id
+)`
+
 const contextCoverageCTE = directTaskContextCTE + `,
 target AS (
   SELECT DISTINCT a.id, a.type,
@@ -199,31 +230,7 @@ ORDER BY target.id LIMIT $`+limitPosition+` OFFSET $`+offsetPosition, pageArgs..
 // used for destructive task cleanup; HostsByTask intentionally retains that
 // narrower, task-owned behavior.
 func (s *AssetStore) HostsByTaskWithSources(taskID int64) ([]string, error) {
-	rows, err := s.db.Query(`WITH `+directTaskContextCTE+`,
-context_assets AS (
-  SELECT DISTINCT a.id
-  FROM assets a
-  WHERE EXISTS (SELECT 1 FROM context_tasks ctx WHERE ctx.task_id=ANY(a.task_ids))
-  UNION
-  SELECT ea.asset_id
-  FROM exploration_anchors ea
-  JOIN exploration_nodes en ON en.id=ea.node_id
-  JOIN context_tasks ctx ON ctx.exploration_id=en.exploration_id
-  UNION
-  SELECT DISTINCT a.id
-  FROM assets a
-  JOIN task_scope ts ON (
-       (ts.kind='company'     AND a.company_id=ts.company_id)
-    OR (ts.kind='root_domain' AND a.root_domain=ts.domain)
-    OR (ts.kind='subdomain'   AND a.domain=ts.domain)
-    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
-    OR (ts.kind='icp' AND (
-         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
-         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
-       ))
-  )
-  JOIN context_tasks ctx ON ctx.task_id=ts.task_id
-)
+	rows, err := s.db.Query(`WITH `+contextAssetsCTE+`
 SELECT COALESCE(a.domain,''), COALESCE(a.ip,''), COALESCE(a.url,'')
 FROM assets a JOIN context_assets ctx ON ctx.id=a.id`, taskID)
 	if err != nil {
@@ -257,4 +264,35 @@ FROM assets a JOIN context_assets ctx ON ctx.id=a.id`, taskID)
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// CountHostsByTaskWithSources is the host total shown in the situational
+// snapshot. It counts the same hosts as HostsByTaskWithSources — trimmed,
+// lowercased domain and ip, plus the URL hostname — without returning the
+// asset rows just to measure them. The URL expression follows net/url: the
+// last "@" separates userinfo, a bracketed IPv6 loses its brackets, a
+// non-numeric port is rejected, and an empty hostname adds nothing.
+func (s *AssetStore) CountHostsByTaskWithSources(taskID int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(`WITH `+contextAssetsCTE+`,
+raw AS MATERIALIZED (
+  SELECT COALESCE(a.domain,'') AS domain, COALESCE(a.ip,'') AS ip, COALESCE(a.url,'') AS url
+  FROM assets a
+  JOIN context_assets ctx ON ctx.id=a.id
+)
+SELECT COUNT(*) FROM (
+  SELECT DISTINCT host FROM (
+    SELECT lower(regexp_replace(candidate, '^[[:space:]]+|[[:space:]]+$', '', 'g')) AS host
+    FROM raw
+    CROSS JOIN LATERAL (VALUES
+      (domain),
+      (ip),
+      (regexp_replace(
+         COALESCE(substring(url from '^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//(?:[^/?#]*@)?(\[[^]]+\]|[^/:?#@]+)(?::[0-9]+)?(?:[/?#]|$)'), ''),
+         '^\[|\]$', '', 'g'))
+    ) AS candidates(candidate)
+  ) trimmed
+  WHERE host <> ''
+) hosts`, taskID).Scan(&n)
+	return n, err
 }

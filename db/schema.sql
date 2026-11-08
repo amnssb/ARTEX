@@ -351,7 +351,10 @@ CREATE TABLE IF NOT EXISTS main_sessions (
 );
 
 -- =====================================================================
--- C. LLM profiles
+-- C. LLM 提供商与模型
+-- 提供商持有连接（格式、地址、密钥、代理、限速、重试、会话头）。
+-- 模型（llm_profiles）挂在提供商下面；任务和 Agent 仍绑定 profile id。
+-- profile 行上的连接列是提供商的一份拷贝：运行时按一行读取，改提供商时同步过来。
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS settings (
     key        TEXT PRIMARY KEY,
@@ -403,6 +406,8 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     retry_empty_interval_ms   INTEGER NOT NULL DEFAULT 0,
     retry_stream_attempts     INTEGER NOT NULL DEFAULT 0,
     retry_stream_interval_ms  INTEGER NOT NULL DEFAULT 0,
+    -- 所属提供商。空表示还没归组（启动迁移会补上）。
+    provider_id      BIGINT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -471,6 +476,188 @@ BEGIN
         UPDATE llm_profiles SET thinking_type = 'disabled', reasoning_effort = ''
             WHERE reasoning_effort = 'off';
     END IF;
+END $$;
+
+-- 提供商：同一把钥匙、同一个地址下的多个模型不再各存一份连接。
+-- 建表放在列补齐之后，迁移才能读到 retry / thinking 等后加列。
+CREATE TABLE IF NOT EXISTS llm_providers (
+    id               BIGSERIAL PRIMARY KEY,
+    name             TEXT NOT NULL,
+    format           TEXT NOT NULL,
+    base_url         TEXT,
+    proxy            TEXT,
+    api_key          TEXT,
+    api_key_hint     TEXT,
+    rate_per_second  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    rate_per_minute  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    session_header_key TEXT NOT NULL DEFAULT '',
+    retry_connect_attempts    INTEGER NOT NULL DEFAULT 0,
+    retry_connect_interval_ms INTEGER NOT NULL DEFAULT 0,
+    retry_empty_attempts      INTEGER NOT NULL DEFAULT 0,
+    retry_empty_interval_ms   INTEGER NOT NULL DEFAULT 0,
+    retry_stream_attempts     INTEGER NOT NULL DEFAULT 0,
+    retry_stream_interval_ms  INTEGER NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE llm_providers DROP CONSTRAINT IF EXISTS llm_providers_format_check;
+ALTER TABLE llm_providers ADD CONSTRAINT llm_providers_format_check
+    CHECK (format IN ('openai','anthropic','openai-responses'));
+ALTER TABLE llm_providers DROP CONSTRAINT IF EXISTS llm_providers_retry_check;
+ALTER TABLE llm_providers ADD CONSTRAINT llm_providers_retry_check CHECK (
+    retry_connect_attempts >= -1 AND retry_empty_attempts >= -1 AND retry_stream_attempts >= -1
+    AND retry_connect_interval_ms >= 0 AND retry_empty_interval_ms >= 0 AND retry_stream_interval_ms >= 0);
+DROP TRIGGER IF EXISTS trg_llm_providers_upd ON llm_providers;
+CREATE TRIGGER trg_llm_providers_upd BEFORE UPDATE ON llm_providers
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS provider_id BIGINT;
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_provider_id_fkey;
+ALTER TABLE llm_profiles
+    ADD CONSTRAINT llm_profiles_provider_id_fkey
+    FOREIGN KEY (provider_id) REFERENCES llm_providers(id) ON DELETE RESTRICT;
+CREATE INDEX IF NOT EXISTS idx_llm_profiles_provider ON llm_profiles(provider_id);
+
+-- 最后一个模型被删掉时，把空提供商一并清掉。直接删 profile 行（测试清理也走这条）
+-- 同样生效。删的是 profile，不是正在被 CASCADE 的提供商，所以不会和父行删除打架。
+CREATE OR REPLACE FUNCTION llm_provider_gc() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.provider_id IS NOT NULL THEN
+        DELETE FROM llm_providers v
+        WHERE v.id = OLD.provider_id
+          AND NOT EXISTS (SELECT 1 FROM llm_profiles p WHERE p.provider_id = v.id);
+    END IF;
+    RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS trg_llm_provider_gc ON llm_profiles;
+CREATE TRIGGER trg_llm_provider_gc AFTER DELETE ON llm_profiles
+    FOR EACH ROW EXECUTE FUNCTION llm_provider_gc();
+
+-- 把还没归组的模型收进提供商。同一格式 + 地址 + 代理 + 密钥视为同一个提供商，
+-- 限速、重试和会话头以最早那条模型为准写回同组每一行（profile 上的连接列是拷贝）。
+-- 地址和密钥都空的草稿各自单独成组，避免把两个还没填完的配置并成一个。
+-- 只处理 provider_id 为空的行，启动重放不会改已经归组的数据。
+DO $$
+DECLARE
+    rec RECORD;
+    new_id BIGINT;
+    pname TEXT;
+    base_name TEXT;
+    host TEXT;
+    n INT;
+BEGIN
+    FOR rec IN
+        SELECT
+            format,
+            base_url,
+            proxy,
+            api_key,
+            (array_agg(api_key_hint ORDER BY id))[1] AS api_key_hint,
+            (array_agg(rate_per_second ORDER BY id))[1] AS rate_per_second,
+            (array_agg(rate_per_minute ORDER BY id))[1] AS rate_per_minute,
+            (array_agg(session_header_key ORDER BY id))[1] AS session_header_key,
+            (array_agg(retry_connect_attempts ORDER BY id))[1] AS retry_connect_attempts,
+            (array_agg(retry_connect_interval_ms ORDER BY id))[1] AS retry_connect_interval_ms,
+            (array_agg(retry_empty_attempts ORDER BY id))[1] AS retry_empty_attempts,
+            (array_agg(retry_empty_interval_ms ORDER BY id))[1] AS retry_empty_interval_ms,
+            (array_agg(retry_stream_attempts ORDER BY id))[1] AS retry_stream_attempts,
+            (array_agg(retry_stream_interval_ms ORDER BY id))[1] AS retry_stream_interval_ms,
+            COUNT(*) AS cnt,
+            (array_agg(id ORDER BY id))[1] AS first_id,
+            (array_agg(name ORDER BY id))[1] AS first_name
+        FROM (
+            SELECT
+                id,
+                name,
+                format,
+                -- 尾部斜杠和首尾空白不应当把同一地址拆成两个提供商。
+                regexp_replace(btrim(COALESCE(base_url, '')), '/+$', '') AS base_url,
+                btrim(COALESCE(proxy, '')) AS proxy,
+                COALESCE(api_key, '') AS api_key,
+                COALESCE(api_key_hint, '') AS api_key_hint,
+                rate_per_second,
+                rate_per_minute,
+                COALESCE(session_header_key, '') AS session_header_key,
+                COALESCE(retry_connect_attempts, 0) AS retry_connect_attempts,
+                COALESCE(retry_connect_interval_ms, 0) AS retry_connect_interval_ms,
+                COALESCE(retry_empty_attempts, 0) AS retry_empty_attempts,
+                COALESCE(retry_empty_interval_ms, 0) AS retry_empty_interval_ms,
+                COALESCE(retry_stream_attempts, 0) AS retry_stream_attempts,
+                COALESCE(retry_stream_interval_ms, 0) AS retry_stream_interval_ms,
+                CASE
+                    WHEN COALESCE(api_key, '') = '' AND regexp_replace(btrim(COALESCE(base_url, '')), '/+$', '') = ''
+                        THEN 'solo:' || id::text
+                    ELSE format || E'\x1f' || regexp_replace(btrim(COALESCE(base_url, '')), '/+$', '') || E'\x1f'
+                        || btrim(COALESCE(proxy, '')) || E'\x1f' || COALESCE(api_key, '')
+                END AS grp
+            FROM llm_profiles
+            WHERE provider_id IS NULL
+        ) s
+        GROUP BY format, base_url, proxy, api_key, grp
+    LOOP
+        host := substring(rec.base_url FROM '^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]+)');
+        IF host IS NOT NULL THEN
+            host := regexp_replace(host, '^.*@', '');
+        END IF;
+        IF rec.cnt = 1 THEN
+            base_name := rec.first_name;
+        ELSIF host IS NOT NULL AND host <> '' THEN
+            base_name := host;
+        ELSE
+            base_name := rec.first_name;
+        END IF;
+        base_name := left(base_name, 180);
+        pname := base_name;
+        n := 2;
+        WHILE EXISTS (SELECT 1 FROM llm_providers WHERE name = pname) LOOP
+            pname := base_name || ' (' || n || ')';
+            n := n + 1;
+            EXIT WHEN n > 100;
+        END LOOP;
+
+        INSERT INTO llm_providers (
+            name, format, base_url, proxy, api_key, api_key_hint,
+            rate_per_second, rate_per_minute, session_header_key,
+            retry_connect_attempts, retry_connect_interval_ms,
+            retry_empty_attempts, retry_empty_interval_ms,
+            retry_stream_attempts, retry_stream_interval_ms
+        ) VALUES (
+            pname, rec.format, NULLIF(rec.base_url, ''), NULLIF(rec.proxy, ''),
+            NULLIF(rec.api_key, ''), NULLIF(rec.api_key_hint, ''),
+            rec.rate_per_second, rec.rate_per_minute, rec.session_header_key,
+            rec.retry_connect_attempts, rec.retry_connect_interval_ms,
+            rec.retry_empty_attempts, rec.retry_empty_interval_ms,
+            rec.retry_stream_attempts, rec.retry_stream_interval_ms
+        ) RETURNING id INTO new_id;
+
+        -- 同组的限速、重试、会话头以最早的模型为准，写回每一行，避免拷贝还留着并组前的旧值。
+        UPDATE llm_profiles p SET
+            provider_id = new_id,
+            format = rec.format,
+            base_url = NULLIF(rec.base_url, ''),
+            proxy = NULLIF(rec.proxy, ''),
+            api_key = NULLIF(rec.api_key, ''),
+            api_key_hint = NULLIF(rec.api_key_hint, ''),
+            rate_per_second = rec.rate_per_second,
+            rate_per_minute = rec.rate_per_minute,
+            session_header_key = rec.session_header_key,
+            retry_connect_attempts = rec.retry_connect_attempts,
+            retry_connect_interval_ms = rec.retry_connect_interval_ms,
+            retry_empty_attempts = rec.retry_empty_attempts,
+            retry_empty_interval_ms = rec.retry_empty_interval_ms,
+            retry_stream_attempts = rec.retry_stream_attempts,
+            retry_stream_interval_ms = rec.retry_stream_interval_ms
+        WHERE p.provider_id IS NULL
+          AND p.format = rec.format
+          AND regexp_replace(btrim(COALESCE(p.base_url, '')), '/+$', '') = rec.base_url
+          AND btrim(COALESCE(p.proxy, '')) = rec.proxy
+          AND COALESCE(p.api_key, '') = rec.api_key
+          AND (
+                NOT (rec.api_key = '' AND rec.base_url = '')
+                OR p.id = rec.first_id
+              );
+    END LOOP;
 END $$;
 
 -- LLM 轮询熔断状态：某个配置连续失败(余额不足/key 失效/限流)后进入冷却，冷却期内

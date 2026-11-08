@@ -4,18 +4,15 @@
 
 AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
+**二开仓库：[github.com/amnssb/ARTEX](https://github.com/amnssb/ARTEX)**
 
-🌐 **在线 Demo**： [https://artex-demo.vercel.app/](https://artex-demo.vercel.app/)
-
-📦 **该仓库为ARTEX最后一个版本纯源码备份，docker部署源失效自行让AI本地构建即可**
+本仓库是 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX) 的二开，不是原作者的官方仓库。镜像是本仓库的 [`ghcr.io/amnssb/artex`](https://github.com/amnssb/ARTEX/pkgs/container/artex)，安装见下方[安装](#安装)。
 
 </div>
 
 ---
 
 ## 截图预览
-
-> 完整交互见[在线 Demo](https://artex-demo.vercel.app/)。
 
 | 仪表盘（总览 / Token 消耗 / 活动流） | 任务列表 |
 | :---: | :---: |
@@ -37,7 +34,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 | :---: | :---: |
 | ![流量](screenshots/traffic.png) | ![对话](screenshots/chat.png) |
 
-| Agent 管理 | LLM 配置 |
+| Agent 管理 | LLM |
 | :---: | :---: |
 | ![Agent](screenshots/agents.png) | ![LLM](screenshots/llm.png) |
 
@@ -66,140 +63,95 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 ## 安装
 
-> 依赖数据库 **PostgreSQL**；探索需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。
-
-### 方式一：一键安装脚本（推荐）
+克隆的是这个二开仓库，不是上游：
 
 ```bash
-git clone https://github.com/Autumn-27/ARTEX.git
+git clone https://github.com/amnssb/ARTEX.git
 cd ARTEX
-./install.sh
 ```
 
-脚本会：检测 / 自动安装 Docker → 让你选 **① 全部 Docker** 或 **② 本地编译运行**：
+镜像用本仓库的 `ghcr.io/amnssb/artex`，标签由 `.env` 的 `ARTEX_TAG` 决定，缺省 `latest`。`./install.sh` 选 **1)** 会拉取这个镜像并启动。也可以在仓库根目录自己编译。
 
-- **① 全部 Docker**：填一个 Postgres 密码（可回车随机）→ 自动写 `.env` → `docker compose up -d`。
-- **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → `go` 编译内嵌单二进制 → 启动。
+需要：
 
-装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
+- **PostgreSQL**
+- **Go 1.26.3**（以 `go.mod` 为准）
+- **Node.js 20+** 与 npm（导出内嵌前端；仓库里的 Dockerfile 也按 Node 20 装 Playwright）
 
-### 方式二：Docker Compose（手动）
+探索还要有一个 LLM。库里还没有激活模型时，环境变量可以先顶上，见[配置](#配置)。
 
-```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
-cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
-# → http://localhost:8787
-```
-
-镜像已含常用工具（ripgrep/curl/vim/npm/nmap…）；`./skills` 与 `./data` 以绑定挂载持久化。
-
-远程 MCP 可在系统设置中选择 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。
-旧版 SSE 服务通常使用 `GET /sse` 建立事件流，再通过服务返回的
-`/message?sessionId=...` 接收 JSON-RPC 请求；配置时将 URL 填为 `/sse`，请求头按
-`Authorization=Bearer <token>` 填写。
-
-### 方式三：下载预编译二进制（Releases）
-
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
+### 编译单二进制（推荐）
 
 ```bash
-cp config.example.json config.json   # 填好 database 连接
+cp config.example.json config.json   # 改 database，示例端口是 5433
+cd web && npm ci && npm run build:static && cd ..
+rm -rf server/webui/dist && cp -r web/out server/webui/dist
+CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
 ./start.sh                           # → http://localhost:8787
 ```
 
-> 请用 `start.sh` / `start.bat` 启动，而不是直接跑 `./artex`。它是个守护脚本：程序退出后按退出码决定是否重新拉起，**页面上的[一键更新](#方式一页面一键更新推荐)靠它完成换装**。直接运行 `./artex` 时更新完就不会被拉起了。
-> 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
+`-tags embedui` 才会把前端打进二进制。没有 npm 时只能 `go build -o artex ./cmd/artex`，页面要另开 `cd web && npm run dev`。
 
-### 方式四：从源码编译单二进制
+也可以 `./install.sh` 选 **2) 本地编译运行**：连已有 Postgres，或用 Docker 只起 `postgres:16-alpine`，然后同样编译并用 `./start.sh` 启动。
+
+首次打开会进 `/setup` 设置管理员密码。
+
+用 `./start.sh`（Windows 为 `start.bat`）启动，不要直接跑 `./artex`。脚本按退出码决定要不要重新拉起，并把 `SIGTERM` 转给进程。后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
+
+远程 MCP 在系统设置里选 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。旧版 SSE 一般是 `GET /sse` 建事件流，再往返回的 `/message?sessionId=...` 发 JSON-RPC；URL 填到 `/sse`，请求头按 `Authorization=Bearer <token>` 写。
+
+### 开发时前后端分开跑
 
 ```bash
-# 1) 前端静态导出
-cd web && npm ci && npm run build:static && cd ..
-# 2) 拷进内嵌目录
-cp -r web/out server/webui/dist
-# 3) 编译（-tags embedui 才内嵌前端）
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
-./start.sh
+./dev.sh
+# 后端 :8787，流量代理 :8788，前端 Next 默认 http://localhost:3000
 ```
 
-### 方式五：构建跨平台 Release 压缩包
+`/api` 反代到 `http://localhost:8787`（可用 `AUTOPENTEST_API` 改）。不内嵌前端：`go run ./cmd/artex`。无后端看界面：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`。
 
-`build.sh` 会先构建并嵌入前端，再使用 Go linker 去除调试信息，并将发布文件压缩为 zip。Release 模式默认生成 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 的 zip 包：
+### Docker Compose
 
 ```bash
+cp .env.example .env          # 填 POSTGRES_PASSWORD，可选 ANTHROPIC_API_KEY
+docker compose pull           # ghcr.io/amnssb/artex + postgres
+docker compose up -d          # → http://localhost:8787
+```
+
+镜像里带常用工具（ripgrep、curl、nmap、Node、Playwright）。`./skills` 和 `./data` 挂进容器，重建不会丢。推送 `v*` tag 时，仓库的 Actions 会构建并推到 `ghcr.io/amnssb/artex`（标签为该版本和 `latest`）。指定标签时在 `.env` 设 `ARTEX_TAG`；不设就是 `latest`。包若仍是私有的，先 `docker login ghcr.io`。
+
+### 打跨平台压缩包
+
+`./build.sh` 先导出并嵌入前端，再用 Go linker 去掉调试信息。`--release` 打 Linux amd64/arm64、macOS amd64/arm64、Windows amd64 的 zip。这个仓库没有版本 tag，不设 `ARTEX_BUILD_VERSION` 时包名里的版本是 `git describe` 的结果（例如 `dist/artex-<commit>-linux-amd64.zip`）。
+
+```bash
+./build.sh                       # 当前系统
 ./build.sh --release
-# 产物：dist/artex-0.3.3-*.zip
-```
-
-UPX 自解压二进制可能与部分 Linux 内核、虚拟化环境或安全策略不兼容，因此默认不启用。可用 `ARTEX_TARGETS` 自定义目标；确认目标运行环境兼容时，可显式传入 `--upx` 进一步缩小二进制：
-
-```bash
 ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 ./build.sh --target linux/amd64 --upx
 ```
+
+UPX 默认关闭。自解压二进制和部分内核、虚拟化或安全策略不兼容，确认目标环境能跑再加 `--upx`。
 
 ---
 
 ## 更新升级
 
-> 升级只换程序、不动数据：Postgres 数据卷 `pgdata`、`./data`（jwt.key / SQLite 等）、`./skills` 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
-
-### 方式一：页面一键更新（推荐）
-
-在 **系统配置** 页（侧边栏「系统配置」→ `/system/settings`）的**版本与更新**卡片里，可以直接检查并安装新版本，无需登录服务器。
-
-点「更新」后：下载当前平台的发布包 → 比对 Release 的 `SHA256SUMS` → 用 `-h` 冒烟测试新二进制 → 暂存为 `artex.new` → 程序退出，由 `start.sh` / `start.bat` 重新拉起并完成换装。页面会自动等到新版本上线后刷新。
-
-- **失败不会留下坏程序**：校验或冒烟不通过就丢弃暂存件、继续跑当前版本；换装后的新版若连续 3 次启动失败，会自动回滚到 `artex.old`（失败的那个留作 `artex.failed` 供排查）。
-- **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
-- **更新会中断正在运行的任务**——更新即重启，请在空闲时进行。
-- **开发构建不给更新**：版本号是 `dev` 或 `git describe` 带后缀时禁用，避免正式版覆盖掉本地调试的二进制。
-- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级仍请用 `docker compose pull artex && docker compose up -d artex`。
-- 访问 GitHub 需要代理时，在同一页面配置**全局代理**即可，更新链路会走它。更新只从 GitHub 域名下载并强制 HTTPS。
-
-### 方式二：一键更新脚本
+Docker 部署的升级是拉取本仓库的新镜像。源码部署则在本目录重新编译，再重启 `./start.sh`。`./data`（含 `jwt.key`）、`./skills` 和 Postgres 里的数据都留着。**不用手跑迁移**：每次启动会幂等重放 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`）。重启会打断正在跑的任务，先备份 `./data` 和数据库。
 
 ```bash
-cd ARTEX
-./update.sh
-```
-
-脚本先可选 `git pull` 拉取最新代码，再让你选 **① Docker 更新** 或 **② 本地编译更新**（与 `install.sh` 对应）：
-
-- **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose pull` → `docker compose up -d`（换新镜像重启即自动迁移）。
-- **② 本地**：重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
-
-### 方式三：Docker Compose（手动）
-
-```bash
-cd ARTEX
-git pull                       # 更新 compose / 脚本（可选）
-# 指定版本：在 .env 设 ARTEX_TAG=v0.2.0；不设则用 latest
+# 镜像：沿用 .env 的 ARTEX_TAG，缺省 latest
 docker compose pull artex
-docker compose up -d artex     # 换新镜像重启 → 自动迁移 schema
-docker image prune -f          # 清理旧镜像（可选）
+docker compose up -d artex
 ```
 
-### 方式四：预编译二进制（Releases）
-
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
-
 ```bash
-cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
-./start.sh
-```
-
-### 方式五：从源码编译
-
-```bash
-git pull
 cd web && npm ci && npm run build:static && cd ..
-cp -r web/out server/webui/dist
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
-# 重启 ./start.sh
+rm -rf server/webui/dist && cp -r web/out server/webui/dist
+CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+# 停掉旧进程后再 ./start.sh
 ```
+
+`./update.sh` 选 **1)** 拉 `ghcr.io/amnssb/artex` 并重建容器，选 **2)** 在本目录重新编译。本地编译编完不会替你重启。重建容器不会把数据库卷清掉。
 
 ---
 
@@ -210,15 +162,27 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 ```json
 {
   "database": {
-    "host": "127.0.0.1", "port": 5432,
+    "host": "127.0.0.1", "port": 5433,
     "user": "artex", "password": "yourpass",
     "dbname": "artex", "sslmode": "disable"
   }
 }
 ```
 
-**LLM**：`export ANTHROPIC_API_KEY=sk-...`（或 `OPENAI_API_KEY`），也可在 UI 的「LLM 配置」页填写。
-可选：`ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY`。
+**LLM**：侧边栏「LLM」（`/system/llm`）按**提供商**管理。地址、密钥、代理、限速、重试和会话头只填一次，下面挂多个模型；上下文窗口、思考、输出上限、流式和轮询优先级按模型单独设。任务和 Agent 仍绑定模型，不绑定提供商。
+
+库里还没有激活模型时，启动会退回环境变量（数据库里的配置优先）：
+
+```bash
+export ANTHROPIC_API_KEY=sk-...    # 或 OPENAI_API_KEY
+# 可选
+export ARTEX_LLM_PROVIDER=anthropic   # anthropic | openai | openai-responses
+export ARTEX_LLM_MODEL=claude-opus-4-8
+export ARTEX_LLM_BASE_URL=
+export ARTEX_LLM_PROXY=            # http / https / socks5
+```
+
+这组变量只在进程里生效，不会写成提供商。要在界面里接着加模型，仍到「LLM」页建一个提供商。
 
 **并发**：每个任务的 work agent 数在「系统设置」里配置（默认 3）。
 
@@ -271,14 +235,11 @@ server {
 
 ### 本地运行与测试
 
-```bash
-./dev.sh    # 后端(:8787) + 流量代理(:8788) + 前端 next dev(:5173) → http://localhost:5173
-```
+前后端分开跑、编译单二进制和自己打镜像见[安装](#安装)。测试：
 
-- 后端：`go run ./cmd/artex`（不带 `-tags embedui` 则不内嵌前端）
-- 前端：`cd web && npm run dev`（`/api` 反代到后端，带热更新）
-- 测试：`go test ./...`
-- Mock 预览（无后端）：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
+```bash
+go test ./...
+```
 
 ---
 
@@ -452,27 +413,16 @@ flowchart TB
 
 ---
 
-## 交流群
-
-扫码关注微信公众号 **SecSentry**，在公众号后台私信即可入群交流。
-
-<div align="center">
-
-<img src="screenshots/wx.png" alt="微信公众号 SecSentry" width="480" />
-
-</div>
-
----
 ## 参考
 
-https://github.com/oritera/Cairn
-
+- 上游：[Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)
+- https://github.com/oritera/Cairn
 
 ## 许可与免责声明
 
 ### 开源协议
 
-本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 授权，完整条款见仓库根目录的 [LICENSE](LICENSE) 文件。
+本仓库是 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX) 的二开，同样采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 授权，完整条款见仓库根目录的 [LICENSE](LICENSE) 文件。
 
 这意味着任何人都可以自由使用、修改和分发本项目，但**衍生作品必须同样以 AGPL-3.0 开源**；特别地，**若你修改本项目并通过网络（如部署为在线服务）向用户提供，也必须向这些用户公开对应的完整源码**。
 

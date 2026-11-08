@@ -894,9 +894,14 @@ func (s *Server) Handler() http.Handler {
 	// Skill 可见性（按名称，更具体，优先于上面的通配路由）
 	mux.HandleFunc("GET /api/visibility/skill/{name}", s.pgSkillVisibility)
 	mux.HandleFunc("POST /api/visibility/skill/toggle", s.pgToggleSkillVisibility)
-	// LLM 多 profile
+	// LLM 多 profile。提供商是共用的连接，模型仍是 llm_profiles 的一行。
+	mux.HandleFunc("GET /api/llm/providers", s.pgListProviders)
+	mux.HandleFunc("POST /api/llm/providers", s.pgSaveProvider)
+	mux.HandleFunc("DELETE /api/llm/providers/{id}", s.pgDeleteProvider)
+	mux.HandleFunc("POST /api/llm/providers/{id}/models", s.pgAddProviderModels)
 	mux.HandleFunc("GET /api/llm/profiles", s.pgListProfiles)
 	mux.HandleFunc("POST /api/llm/profiles", s.pgSaveProfile)
+	mux.HandleFunc("PATCH /api/llm/profiles/{id}", s.pgUpdateModel)
 	mux.HandleFunc("DELETE /api/llm/profiles/{id}", s.pgDeleteProfile)
 	mux.HandleFunc("POST /api/llm/profiles/active", s.pgActivateProfile)
 	mux.HandleFunc("GET /api/llm/retry-policy", s.pgGetLLMRetryPolicy)
@@ -1373,6 +1378,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		ThinkingType     string `json:"thinking_type"`
 		ReasoningEffort  string `json:"reasoning_effort"`
 		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
+		ProviderID       *int64 `json:"provider_id"`        // 提供商已存密钥的兜底，模型还没落库时用它
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
 	}
@@ -1399,6 +1405,16 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
 	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+			if cfg.APIKey == "" {
+				cfg.APIKey = p.APIKey
+			}
+			if cfg.SessionHeaderKey == "" {
+				cfg.SessionHeaderKey = p.SessionHeaderKey
+			}
+		}
+	}
+	if req.ProviderID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+		if p, err := s.m.pg.ProviderByID(*req.ProviderID); err == nil && p != nil {
 			if cfg.APIKey == "" {
 				cfg.APIKey = p.APIKey
 			}

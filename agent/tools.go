@@ -354,7 +354,7 @@ func (t *ToolSet) graphOverview() actool.CoreTool {
 func (t *ToolSet) graphOverviewData() map[string]any {
 	out := map[string]any{}
 	// goals summary folded in so the planner needn't call list_goals each round.
-	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
+	goals, _ := t.ts.ListOverview(db.KindGoal, 100)
 	gsum := make([]map[string]any, 0, len(goals))
 	for _, g := range goals {
 		var p map[string]any
@@ -364,7 +364,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["goals"] = gsum
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
 	// planner reads them every round when generating intents (否则只写不读).
-	hints, _ := t.ts.ListByKind(db.KindHint, 50)
+	hints, _ := t.ts.ListOverview(db.KindHint, 50)
 	hsum := make([]map[string]any, 0, len(hints))
 	for _, h := range hints {
 		var p map[string]any
@@ -376,23 +376,6 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		hsum = append(hsum, hint)
 	}
 	out["hints"] = hsum
-	// lineage from the exploration edges: an intent's parents (what it
-	// derived_from — possibly several facts combined) and its yields (the
-	// facts/findings it produced). factFrom maps a fact → the intent that
-	// produced it. This is the relationship layer the flat lists lacked.
-	edges, _ := t.ts.Edges(5000)
-	parentsOf := map[int64][]int64{}
-	yieldsOf := map[int64][]int64{}
-	factFrom := map[int64]int64{}
-	for _, e := range edges {
-		switch e.Rel {
-		case db.RelDerivedFrom, db.RelSpawns: // upstream: derived_from (fact/finding/intent→intent) or spawns (origin fact→goal, legacy begin→intent)
-			parentsOf[e.To] = append(parentsOf[e.To], e.From)
-		case db.RelYields: // intent --yields--> fact/finding
-			yieldsOf[e.From] = append(yieldsOf[e.From], e.To)
-			factFrom[e.To] = e.From
-		}
-	}
 	// cold-digest §6: members folded into an active digest are shown via cold_digests
 	// (below), not the flat recent_* lists. `covered` maps member id → its digest id.
 	// §6 render-time revival check: a covered member that has become hot again (a new
@@ -401,17 +384,19 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	covered, _ := t.ts.CoveredMembers()
 	// Render-time hot set (ancestor of a live intent / fact under a live intent).
 	// §6 revival check: a covered member that revived (now hot) must NOT stay folded
-	// — hidden() only folds a member out when it is covered AND still cold. Computed
-	// every round (cheap for real graph sizes); nil map degrades safely.
+	// — hidden() only folds a member out when it is covered AND still cold.
+	// Nothing folded: skip the walk. A failed light read leaves hot nil, so covered
+	// members stay folded instead of pouring the cold region back into the snapshot.
 	var hotAtRender map[int64]bool
-	if cg, _, err := loadColdGraph(t.ts); err == nil {
-		hotAtRender = cg.hotSet()
+	if len(covered) > 0 {
+		if cg, err := loadColdGraphLight(t.ts); err == nil {
+			hotAtRender = cg.hotSet()
+		}
 	}
 	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
 	const openIntentsCap = 30
 	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
-	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
-	all, _ := t.ts.ListByKind(db.KindIntent, 300)
+	all, _ := t.ts.ListOverview(db.KindIntent, 300)
 	var running, recentDone []*db.Node
 	for _, n := range all {
 		switch n.State {
@@ -424,7 +409,6 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			recentDone = append(recentDone, n) // 最新在前（all 按 id 降序）；折叠的已剔除，输出时截最新 N
 		}
 	}
-	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
 	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
 	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
 	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
@@ -437,24 +421,57 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	} else {
 		out["frontier_open"] = len(fr)
 	}
+	// findings_total / facts 是这类节点的真实总数，不是下面窗口的长度。窗口顶到 1000
+	// 就停更，读失败时又会变成 0，规划者会把"没读到"当成"还没有"。失败则不写这两个键。
+	if stats, err := t.ts.Stats(); err == nil {
+		out["findings_total"] = stats[db.KindFinding] // 确认漏洞总数（目标判定看它）；明细见 finding_list
+		out["facts"] = stats[db.KindFact]             // 探索事实/结论数（含否定结论）
+	}
 	// findings (confirmed vulns) and facts (worker exploration results) are
 	// now distinct node kinds. recent_facts surfaces fact summaries (esp.
 	// negative results) so the planner sees them in one call; full content
 	// via node_detail(id).
-	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
-	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
-	out["findings_total"] = len(vulnNodes)             // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
-	out["facts"] = len(factNodes)                      // 探索事实/结论数（含否定结论）
-	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，vulnNodes 已按 id 降序即最新在前），
+	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，按 id 降序即最新在前），
 	// 让 planner 每轮判目标时一眼看到最近确认的漏洞；全量/更早的用 list_findings 取。
 	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。
 	// evidence/assets/vulnclass/severity/state 等仍可用 list_findings / node_detail(id) 取。
 	const findingListCap = 10
-	findingList := make([]map[string]any, 0, findingListCap)
-	for _, n := range vulnNodes {
-		if len(findingList) >= findingListCap {
+	vulnNodes, _ := t.ts.ListOverview(db.KindFinding, findingListCap)
+	// recent_facts：非折叠事实里最新的一窗（≤N）。已折进 digest 且仍冷的（hidden）走
+	// cold_digests，不在此重复。有折叠时要越过被折掉的条目才能凑满窗口，扫描范围仍是
+	// 原先的最新 1000 条，但只取摘要列。每条 {id, summary, from_intent?, confidence?}；
+	// evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
+	const recentFactsCap = 20
+	factScan := recentFactsCap
+	if len(covered) > 0 {
+		factScan = 1000
+	}
+	factNodes, _ := t.ts.ListOverview(db.KindFact, factScan) // newest first
+	shownFacts := make([]*db.Node, 0, recentFactsCap)
+	for _, n := range factNodes {
+		if len(shownFacts) >= recentFactsCap {
 			break
 		}
+		if hidden(n.ID) {
+			continue // 已折进 digest 且仍冷 —— 见 cold_digests
+		}
+		shownFacts = append(shownFacts, n)
+	}
+	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
+	// 更早的看 done_intents_total 计数 + node_detail(id)。
+	const recentDoneCap = 12
+	if len(recentDone) > recentDoneCap {
+		recentDone = recentDone[:recentDoneCap]
+	}
+	// lineage：意图的 parents（derived_from，可能由多条事实共同产生）和 yields（它产出的
+	// 事实/发现），以及 factFrom（事实/发现 → 产生它的意图）。只取窗口里这些节点碰得到的边；
+	// 窗口之外、两边都不在展示里的边，概览用不上。
+	lineageEdges, _ := t.ts.LineageEdges(appendNodeIDs(nil, fr, running, recentDone, vulnNodes, shownFacts))
+	parentsOf, yieldsOf, factFrom := lineageFromEdges(lineageEdges)
+	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
+	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
+	findingList := make([]map[string]any, 0, findingListCap)
+	for _, n := range vulnNodes {
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
 		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
@@ -464,18 +481,8 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		findingList = append(findingList, m)
 	}
 	out["finding_list"] = findingList
-	// recent_facts：非折叠事实里最新的一窗（≤N，factNodes 按 id 降序即最新在前）。已折进
-	// digest 且仍冷的（hidden）走 cold_digests，不在此重复。每条 {id, summary, from_intent?,
-	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
-	const recentFactsCap = 20
-	recentFacts := make([]map[string]any, 0, recentFactsCap)
-	for _, n := range factNodes {
-		if len(recentFacts) >= recentFactsCap {
-			break
-		}
-		if hidden(n.ID) {
-			continue // 已折进 digest 且仍冷 —— 见 cold_digests
-		}
+	recentFacts := make([]map[string]any, 0, len(shownFacts))
+	for _, n := range shownFacts {
 		m := compactNode(n)
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本事实由哪个意图产生
@@ -491,12 +498,6 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		recentFacts = append(recentFacts, m)
 	}
 	out["recent_facts"] = recentFacts
-	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
-	// 更早的看 done_intents_total 计数 + node_detail(id)。
-	const recentDoneCap = 12
-	if len(recentDone) > recentDoneCap {
-		recentDone = recentDone[:recentDoneCap]
-	}
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
 	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
 	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
@@ -538,10 +539,10 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 					}
 				}
 			}
-			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
+			if hostCount, err := t.as.CountHostsByTaskWithSources(t.taskID); err == nil {
 				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
 				// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
-				m["host_count"] = len(hosts)
+				m["host_count"] = hostCount
 			}
 			if len(m) > 0 {
 				out["coverage"] = m
@@ -549,6 +550,35 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		}
 	}
 	return out
+}
+
+// lineageFromEdges indexes the edges the snapshot actually renders:
+// parents and yields of an intent, and the intent that produced a fact or finding.
+func lineageFromEdges(edges []db.Edge) (parentsOf, yieldsOf map[int64][]int64, factFrom map[int64]int64) {
+	parentsOf = map[int64][]int64{}
+	yieldsOf = map[int64][]int64{}
+	factFrom = map[int64]int64{}
+	for _, e := range edges {
+		switch e.Rel {
+		case db.RelDerivedFrom, db.RelSpawns: // upstream: derived_from or spawns
+			parentsOf[e.To] = append(parentsOf[e.To], e.From)
+		case db.RelYields: // intent --yields--> fact/finding
+			yieldsOf[e.From] = append(yieldsOf[e.From], e.To)
+			factFrom[e.To] = e.From
+		}
+	}
+	return parentsOf, yieldsOf, factFrom
+}
+
+func appendNodeIDs(ids []int64, groups ...[]*db.Node) []int64 {
+	for _, group := range groups {
+		for _, n := range group {
+			if n != nil {
+				ids = append(ids, n.ID)
+			}
+		}
+	}
+	return ids
 }
 
 func inheritedMap(m map[string]any, sourceTaskID int64) map[string]any {
@@ -634,7 +664,7 @@ func recentTerminalIntents(store *db.ExplorationStore, limit int) []*db.Node {
 	cursor := int64(0)
 	out := make([]*db.Node, 0, limit)
 	for len(out) < limit {
-		page, more, err := store.ListByKindPage(db.KindIntent, cursor, batch)
+		page, more, err := store.ListOverviewPage(db.KindIntent, cursor, batch)
 		if err != nil || len(page) == 0 {
 			break
 		}
@@ -685,21 +715,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		}
 		stats, statsErr := ts.Stats()
 
-		edges, _ := ts.Edges(5000)
-		parentsOf := map[int64][]int64{}
-		yieldsOf := map[int64][]int64{}
-		factFrom := map[int64]int64{}
-		for _, edge := range edges {
-			switch edge.Rel {
-			case db.RelDerivedFrom, db.RelSpawns:
-				parentsOf[edge.To] = append(parentsOf[edge.To], edge.From)
-			case db.RelYields:
-				yieldsOf[edge.From] = append(yieldsOf[edge.From], edge.To)
-				factFrom[edge.To] = edge.From
-			}
-		}
-
-		goals, _ := ts.ListByKind(db.KindGoal, relatedOverviewMaxGoalsPerSource)
+		goals, _ := ts.ListOverview(db.KindGoal, relatedOverviewMaxGoalsPerSource)
 		goalSummary := make([]map[string]any, 0, len(goals))
 		for _, goal := range goals {
 			var payload map[string]any
@@ -710,7 +726,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		}
 		item["goals"] = goalSummary
 
-		hints, _ := ts.ListByKind(db.KindHint, relatedOverviewMaxHintsPerSource)
+		hints, _ := ts.ListOverview(db.KindHint, relatedOverviewMaxHintsPerSource)
 		hintSummary := make([]map[string]any, 0, len(hints))
 		for _, hint := range hints {
 			var payload map[string]any
@@ -721,11 +737,11 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		}
 		item["hints"] = hintSummary
 
-		facts, _ := ts.ListByKind(db.KindFact, relatedOverviewMaxFactsPerSource)
-		findings, _ := ts.ListByKind(db.KindFinding, relatedOverviewMaxFindingsPerTask)
-		intentNodes, _ := ts.ListByKind(db.KindIntent, 300)
-		terminalIntent := make(map[int64]bool, len(intentNodes))
-		for _, intent := range intentNodes {
+		facts, _ := ts.ListOverview(db.KindFact, relatedOverviewMaxFactsPerSource)
+		findings, _ := ts.ListOverview(db.KindFinding, relatedOverviewMaxFindingsPerTask)
+		intentStates, _ := ts.ListStates(db.KindIntent, 300)
+		terminalIntent := make(map[int64]bool, len(intentStates))
+		for _, intent := range intentStates {
 			terminalIntent[intent.ID] = inheritedIntentSummaryState(intent.State)
 		}
 		item["facts"] = len(facts)
@@ -738,6 +754,23 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 				budget.truncated = true
 			}
 		}
+		recentDoneRaw := recentTerminalIntents(ts, relatedOverviewMaxIntentsPerTask)
+		recentDone := recentDoneRaw[:0] // in-place filter: drop this source's folded intents (§2)
+		for _, intent := range recentDoneRaw {
+			if hidden(intent.ID) {
+				continue
+			}
+			recentDone = append(recentDone, intent)
+		}
+		var shownFacts []*db.Node
+		for _, fact := range facts {
+			if !hidden(fact.ID) {
+				shownFacts = append(shownFacts, fact)
+			}
+		}
+		// 关联任务概览同样只给窗口里的节点补血缘，不把来源任务的边全表拉回来。
+		lineageEdges, _ := ts.LineageEdges(appendNodeIDs(nil, shownFacts, findings, recentDone))
+		parentsOf, yieldsOf, factFrom := lineageFromEdges(lineageEdges)
 		recentFindings := make([]map[string]any, 0, len(findings))
 		for _, finding := range findings {
 			entry := inheritedMap(compactFinding(finding), source.Task.TaskID)
@@ -765,14 +798,6 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		}
 		item["recent_facts"] = recentFacts
 
-		recentDoneRaw := recentTerminalIntents(ts, relatedOverviewMaxIntentsPerTask)
-		recentDone := recentDoneRaw[:0] // in-place filter: drop this source's folded intents (§2)
-		for _, intent := range recentDoneRaw {
-			if hidden(intent.ID) {
-				continue
-			}
-			recentDone = append(recentDone, intent)
-		}
 		for _, intent := range recentDone {
 			intent.Inherited = true
 			intent.SourceTaskID = source.Task.TaskID

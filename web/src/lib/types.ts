@@ -1056,6 +1056,38 @@ export interface LLMProfile {
   session_header_key?: string;
   // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
   retry?: LLMRetryOverride;
+  // 所属提供商。下拉框仍按模型 id 选；提供商只是这批模型共用的连接。
+  provider_id?: string;
+  provider_name?: string;
+}
+
+// 一个 AI 提供商：地址、密钥、代理、限速、重试只存一份，下面挂多个模型。
+export interface LLMProvider {
+  id: string;
+  name: string;
+  format: LLMProfile["format"];
+  base_url?: string;
+  proxy?: string;
+  api_key_hint?: string;
+  rate_per_second: number;
+  rate_per_minute: number;
+  session_header_key?: string;
+  retry?: LLMRetryOverride;
+  models: LLMProfile[];
+}
+
+// 往提供商下加一个模型时要填的字段。连接信息不在这里。
+export interface LLMModelInput {
+  name?: string;
+  model: string;
+  context_window_k?: number;
+  thinking_type?: string;
+  reasoning_effort?: string;
+  priority?: number;
+  pool_exclude?: boolean;
+  streaming?: boolean;
+  max_tokens?: number;
+  max_tokens_field?: string;
 }
 
 // ---- LLM 重试策略 ----

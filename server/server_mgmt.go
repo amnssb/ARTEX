@@ -1820,6 +1820,9 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
+		if writeLLMConfigErr(w, err) {
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -1938,6 +1941,240 @@ func (s *Server) pgActivateProfile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// writeLLMConfigErr maps provider/model sentinel errors to the status the settings
+// page can show directly. Unrecognized errors return false so the caller can 500.
+func writeLLMConfigErr(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, db.ErrLLMProviderNameRequired):
+		writeErr(w, 400, "请填写提供商名称")
+	case errors.Is(err, db.ErrLLMProviderFormat):
+		writeErr(w, 400, "不支持的接口格式")
+	case errors.Is(err, db.ErrLLMModelRequired):
+		writeErr(w, 400, "请至少添加一个模型")
+	case errors.Is(err, db.ErrLLMProviderNotFound):
+		writeErr(w, 404, "提供商不存在")
+	case errors.Is(err, db.ErrLLMProfileNotFound):
+		writeErr(w, 404, "模型不存在")
+	case errors.Is(err, db.ErrLLMModelNameTaken):
+		writeErr(w, 409, "已有同名模型")
+	case errors.Is(err, db.ErrLLMModelExists):
+		writeErr(w, 409, "该提供商下已有这个模型")
+	case errors.Is(err, db.ErrActiveLLMProfileDelete):
+		writeErr(w, 409, "该提供商下有当前激活的模型，请先激活其他模型")
+	default:
+		return false
+	}
+	return true
+}
+
+func normalizeModelSpec(format string, m *db.LLMModelSpec) {
+	m.Name = strings.TrimSpace(m.Name)
+	m.Model = strings.TrimSpace(m.Model)
+	if m.MaxTokens < 0 {
+		m.MaxTokens = 0
+	}
+	// 上限字段名只有 Chat Completions 认；别的格式存下来会让下一轮读者以为发出去了。
+	if format != "openai" || m.MaxTokensField != llm.MaxTokensFieldCompletion {
+		m.MaxTokensField = ""
+	}
+}
+
+func (s *Server) pgListProviders(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	ps, err := pg.ListProviders()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"providers": llmProviderDTOs(ps)})
+}
+
+// pgSaveProvider creates a provider plus its first models, or updates the shared
+// connection. Updating does not add models — that is a separate call, so editing
+// the key cannot accidentally clone the model list.
+func (s *Server) pgSaveProvider(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	var body struct {
+		ID               int64             `json:"id"`
+		Name             string            `json:"name"`
+		Format           string            `json:"format"`
+		BaseURL          string            `json:"base_url"`
+		Proxy            string            `json:"proxy"`
+		APIKey           string            `json:"api_key"`
+		RatePerSecond    float64           `json:"rate_per_second"`
+		RatePerMinute    float64           `json:"rate_per_minute"`
+		SessionHeaderKey string            `json:"session_header_key"`
+		Retry            db.RetryOverride  `json:"retry"`
+		Models           []db.LLMModelSpec `json:"models"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	p := &db.LLMProvider{
+		ID:               body.ID,
+		Name:             body.Name,
+		Format:           strings.TrimSpace(body.Format),
+		BaseURL:          strings.TrimSpace(body.BaseURL),
+		Proxy:            strings.TrimSpace(body.Proxy),
+		APIKey:           body.APIKey,
+		RatePerSecond:    body.RatePerSecond,
+		RatePerMinute:    body.RatePerMinute,
+		SessionHeaderKey: strings.TrimSpace(body.SessionHeaderKey),
+		Retry:            body.Retry,
+	}
+	for i := range body.Models {
+		normalizeModelSpec(p.Format, &body.Models[i])
+	}
+	if p.ID == 0 {
+		if len(body.Models) > 200 {
+			writeErr(w, 400, "一次最多添加 200 个模型")
+			return
+		}
+		id, modelIDs, err := pg.CreateProvider(p, body.Models)
+		if err != nil {
+			if writeLLMConfigErr(w, err) {
+				return
+			}
+			writeErr(w, 500, err.Error())
+			return
+		}
+		s.invalidateProfileAgents()
+		s.reapplyActiveProfile()
+		writeJSON(w, 200, map[string]any{"id": id, "model_ids": modelIDs})
+		return
+	}
+	id, err := pg.SaveProvider(p)
+	if err != nil {
+		if writeLLMConfigErr(w, err) {
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	s.invalidateProfileAgents()
+	s.reapplyActiveProfile()
+	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+func (s *Server) pgAddProviderModels(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	id, ok := pathInt(r, "id")
+	if !ok || id <= 0 {
+		writeErr(w, 400, "提供商 id 无效")
+		return
+	}
+	var body struct {
+		Models []db.LLMModelSpec `json:"models"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if len(body.Models) > 200 {
+		writeErr(w, 400, "一次最多添加 200 个模型")
+		return
+	}
+	prov, err := pg.ProviderByID(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if prov == nil {
+		writeErr(w, 404, "提供商不存在")
+		return
+	}
+	for i := range body.Models {
+		normalizeModelSpec(prov.Format, &body.Models[i])
+	}
+	ids, skipped, err := pg.AddProviderModels(id, body.Models)
+	if err != nil {
+		if writeLLMConfigErr(w, err) {
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	s.invalidateProfileAgents()
+	s.reapplyActiveProfile()
+	writeJSON(w, 200, map[string]any{"ids": ids, "skipped": skipped})
+}
+
+func (s *Server) pgUpdateModel(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	id, ok := pathInt(r, "id")
+	if !ok || id <= 0 {
+		writeErr(w, 400, "模型 id 无效")
+		return
+	}
+	var body db.LLMModelSpec
+	if err := decode(r, &body); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	cur, err := pg.ProfileByID(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if cur == nil {
+		writeErr(w, 404, "模型不存在")
+		return
+	}
+	normalizeModelSpec(cur.Format, &body)
+	if err := pg.UpdateModel(id, body); err != nil {
+		if writeLLMConfigErr(w, err) {
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	s.invalidateProfileAgents()
+	s.reapplyActiveProfile()
+	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+func (s *Server) pgDeleteProvider(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	id, ok := pathInt(r, "id")
+	if !ok || id <= 0 {
+		writeErr(w, 400, "提供商 id 无效")
+		return
+	}
+	deleted, err := pg.DeleteProvider(r.Context(), id)
+	for _, modelID := range deleted {
+		s.llmHealth.Reset(modelID)
+	}
+	if len(deleted) > 0 {
+		s.invalidateProfileAgents()
+		s.restoreTasksAfterProfileDelete(pg)
+		s.reapplyActiveProfile()
+	}
+	if err != nil {
+		if writeLLMConfigErr(w, err) {
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": id, "models": deleted})
+}
+
 // pgLLMPoolStatus reports the failover ("轮询") switches, the resolved chain order
 // and every profile's circuit-breaker state — what the LLM page renders as the
 // "轮询顺序" strip and the per-card health badges.
@@ -1978,11 +2215,12 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic"
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Proxy     string `json:"proxy"`
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		Provider   string `json:"provider"` // "openai" | "anthropic"
+		BaseURL    string `json:"base_url"`
+		APIKey     string `json:"api_key"`
+		Proxy      string `json:"proxy"`
+		ProfileID  *int64 `json:"profile_id"`  // fallback: use stored key from this profile
+		ProviderID *int64 `json:"provider_id"` // fallback: use the provider's stored key
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1992,6 +2230,11 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey == "" && req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+			apiKey = p.APIKey
+		}
+	}
+	if apiKey == "" && req.ProviderID != nil {
+		if p, err := s.m.pg.ProviderByID(*req.ProviderID); err == nil && p != nil {
 			apiKey = p.APIKey
 		}
 	}

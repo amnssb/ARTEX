@@ -1,8 +1,16 @@
 # 更新日志
 
-本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+本文件格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+[0.3.15] 及更早的条目是上游 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX) 的记录，文末带版本号的比较链接也指向上游标签。本仓库 [amnssb/ARTEX](https://github.com/amnssb/ARTEX) 是它的二开，二开之后的改动写在 [Unreleased]。
 
 ## [Unreleased]
+
+### 模型
+
+#### 新增的功能
+
+- **一个提供商下挂多个模型**：「系统 → 模型」不再把地址、密钥、代理、限速、重试和会话头按模型各存一份。新建提供商时填一次连接，可从接口勾选或手填多个模型；之后再加模型不用重填连接。上下文窗口、思考、输出上限、流式和轮询优先级仍按模型单独设置。任务和 Agent 继续绑定原来的模型 id。下次启动时，格式、地址、代理和密钥都相同的旧配置会并成一个提供商，限速、重试和会话头保留最早那一条；地址或密钥都空的草稿各自单独成组。删掉最后一个模型时提供商一并去掉；下面还有当前激活模型时不能整组删除。
 
 ## [0.3.15] - 2026-10-07
 
@@ -886,7 +894,7 @@
 - [@Autumn-27](https://github.com/Autumn-27)
 - [@neouks](https://github.com/neouks)
 
-[Unreleased]: https://github.com/Autumn-27/ARTEX/compare/v0.3.10...HEAD
+[Unreleased]: https://github.com/amnssb/ARTEX/commits/main
 [0.3.10]: https://github.com/Autumn-27/ARTEX/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/Autumn-27/ARTEX/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/Autumn-27/ARTEX/compare/v0.3.7...v0.3.8

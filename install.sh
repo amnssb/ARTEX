@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARTEX 安装脚本：① 全部 Docker  ② 本地编译运行
+# ARTEX 安装脚本：① 拉取 ghcr.io/amnssb/artex  ② 本地编译运行
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
 
@@ -46,7 +46,7 @@ install_docker(){
     info "沿用已存在的 .env"
   fi
   info "拉取镜像并启动…"
-  docker compose pull || true
+  docker compose pull
   docker compose up -d
   ok "启动完成 → http://localhost:8787"
   info "查看日志：docker compose logs -f artex"
@@ -107,15 +107,15 @@ JSON
   ok "编译完成 → ./artex"
 
   info "启动…（Ctrl-C 退出）"
-  ./artex
+  ./start.sh
 }
 
 echo "=============================="
-echo "  ARTEX 安装"
-echo "  1) 全部 Docker 安装"
-echo "  2) 本地运行（go 编译）"
+echo "  ARTEX 安装（本目录源码）"
+echo "  1) Docker Compose（ghcr.io/amnssb/artex）"
+echo "  2) 本地编译运行（推荐）"
 echo "=============================="
-case "$(ask '选择' 1)" in
+case "$(ask '选择' 2)" in
   1) install_docker ;;
   2) install_local ;;
   *) die "无效选择" ;;

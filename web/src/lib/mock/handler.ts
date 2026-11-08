@@ -2259,6 +2259,37 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return { ok: true, latency_ms: 128, model: String(b.model ?? "claude-opus-4-8"), reply: "OK" };
   if (path === "/llm/profiles" && m === "GET") return { profiles: D.llmProfiles };
   if (path === "/llm/profiles" && m === "POST") return { id: Number(b.id) || 3 };
+  if (path === "/llm/providers" && m === "GET") {
+    const byID = new Map<string, Record<string, unknown>>();
+    for (const profile of D.llmProfiles) {
+      const id = profile.provider_id || profile.id;
+      let group = byID.get(id);
+      if (!group) {
+        group = {
+          id,
+          name: profile.provider_name || profile.name,
+          format: profile.format,
+          base_url: profile.base_url,
+          proxy: profile.proxy,
+          api_key_hint: profile.api_key_hint,
+          rate_per_second: profile.rate_per_second,
+          rate_per_minute: profile.rate_per_minute,
+          session_header_key: profile.session_header_key ?? "",
+          retry: profile.retry,
+          models: [],
+        };
+        byID.set(id, group);
+      }
+      (group.models as typeof D.llmProfiles).push(profile);
+    }
+    return { providers: [...byID.values()] };
+  }
+  if (path === "/llm/providers" && m === "POST") return { id: Number(b.id) || 4, model_ids: [4] };
+  if (seg[0] === "llm" && seg[1] === "providers" && seg[3] === "models" && m === "POST")
+    return { ids: [4], skipped: 0 };
+  if (seg[0] === "llm" && seg[1] === "providers" && seg.length === 3 && m === "DELETE")
+    return { deleted: Number(seg[2]), models: [] };
+  if (seg[0] === "llm" && seg[1] === "profiles" && seg.length === 3 && m === "PATCH") return { id: Number(seg[2]) };
   if (path === "/llm/profiles/active") return { ok: true };
   if (path === "/llm/pool" && m === "GET") return D.llmPool;
   if (path === "/llm/pool/reset")

@@ -700,6 +700,25 @@ func (u *TokenUsage) add(other TokenUsage) {
 
 const nodeCols = `id, kind, payload, priority, state, COALESCE(origin,''), COALESCE(owner,''), COALESCE(blocked_reason,''), COALESCE(delete_reason,''), created_at`
 
+// overviewPayload is the situational snapshot's node body: the summary the
+// planner reads, plus the few keys that disambiguate an intent, a hint, or a
+// finding. Evidence and raw tool output stay in the row and are fetched later
+// through node_detail; the snapshot is rebuilt every planner round and every
+// worker start, so those bodies must not ride along.
+const overviewPayload = `jsonb_strip_nulls(jsonb_build_object(
+	'summary', payload->'summary',
+	'text', payload->'text',
+	'confidence', payload->'confidence',
+	'asset_ids', payload->'asset_ids',
+	'target_ids', payload->'target_ids',
+	'target_id', payload->'target_id',
+	'traffic_refs', payload->'traffic_refs',
+	'vulnclass', payload->'vulnclass',
+	'severity', payload->'severity'
+))`
+
+const overviewNodeCols = `id, kind, ` + overviewPayload + `, priority, state, COALESCE(origin,''), COALESCE(owner,''), COALESCE(blocked_reason,''), COALESCE(delete_reason,''), created_at`
+
 func scanNode(sc interface{ Scan(...any) error }) (*Node, error) {
 	var n Node
 	var payload []byte
@@ -734,6 +753,69 @@ WHERE exploration_id=$1 AND kind=$2 ORDER BY id DESC LIMIT $3`, s.expID, kind, l
 	}
 	defer rows.Close()
 	return scanNodes(rows)
+}
+
+// ListOverview is ListByKind for the situational snapshot. Same newest-first
+// window, but each payload is only the keys the snapshot prints. Callers that
+// need evidence use ListByKind or GetNode.
+func (s *ExplorationStore) ListOverview(kind string, limit int) ([]*Node, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.Query(`SELECT `+overviewNodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2 ORDER BY id DESC LIMIT $3`, s.expID, kind, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// ListOverviewPage is ListByKindPage with the snapshot payload. Same cursor:
+// up to limit nodes with id < before (before<=0 starts at the newest).
+func (s *ExplorationStore) ListOverviewPage(kind string, before int64, limit int) ([]*Node, bool, error) {
+	if limit <= 0 {
+		limit = 300
+	}
+	rows, err := s.db.Query(`SELECT `+overviewNodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2 AND ($3 <= 0 OR id < $3)
+ORDER BY id DESC LIMIT $4`, s.expID, kind, before, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	nodes, err := scanNodes(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(nodes) > limit
+	if hasMore {
+		nodes = nodes[:limit]
+	}
+	return nodes, hasMore, nil
+}
+
+// ListStates returns id, kind, and state for the newest nodes of a kind.
+// "Has this intent already finished?" does not need the intent body.
+func (s *ExplorationStore) ListStates(kind string, limit int) ([]LightNode, error) {
+	if limit <= 0 {
+		limit = 300
+	}
+	rows, err := s.db.Query(`SELECT id, kind, state FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2 ORDER BY id DESC LIMIT $3`, s.expID, kind, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LightNode
+	for rows.Next() {
+		var n LightNode
+		if err := rows.Scan(&n.ID, &n.Kind, &n.State); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 // ListByKindPage returns one newest-first page of nodes of a kind for reverse
@@ -978,6 +1060,14 @@ type Edge struct {
 	To   int64
 }
 
+// LightNode is a node without its payload. Folding and "is this intent
+// finished" only need identity, kind, and state.
+type LightNode struct {
+	ID    int64
+	Kind  string
+	State string
+}
+
 // Edges lists exploration edges (for graph viz).
 func (s *ExplorationStore) Edges(limit int) ([]Edge, error) {
 	if limit <= 0 {
@@ -988,6 +1078,112 @@ func (s *ExplorationStore) Edges(limit int) ([]Edge, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	var out []Edge
+	for rows.Next() {
+		var e Edge
+		if err := rows.Scan(&e.From, &e.Rel, &e.To); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// LightGraph reads every node as id/kind/state and every edge as src/rel/dst.
+// Folding decides which facts and intents stay in the situational snapshot: a
+// covered member upstream of a live intent has to reappear. That walk is wrong
+// if any node or causal edge is missing, so this read is not capped — but it
+// never touches the payload. Compaction still uses Nodes, because a digest is
+// written from those bodies.
+func (s *ExplorationStore) LightGraph() ([]LightNode, []Edge, error) {
+	rows, err := s.db.Query(`SELECT id, kind, state FROM exploration_nodes WHERE exploration_id=$1`, s.expID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var nodes []LightNode
+	for rows.Next() {
+		var n LightNode
+		if err := rows.Scan(&n.ID, &n.Kind, &n.State); err != nil {
+			return nil, nil, err
+		}
+		nodes = append(nodes, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	// Release this connection before the edge read. Holding it open while
+	// edgesAll asks the pool for another one can stall when the pool is full.
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	edges, err := s.edgesAll()
+	if err != nil {
+		return nil, nil, err
+	}
+	return nodes, edges, nil
+}
+
+// edgesAll returns every edge of this exploration. Edges() defaults to 5000
+// rows and is unordered; using that cap here would fold a live chain once the
+// graph outgrows it. An edge is three columns, not a payload.
+func (s *ExplorationStore) edgesAll() ([]Edge, error) {
+	rows, err := s.db.Query(`SELECT src_id, rel, dst_id FROM exploration_edges WHERE exploration_id=$1`, s.expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEdges(rows)
+}
+
+// LineageEdges returns derived_from, spawns, and yields edges that touch any
+// of ids. The snapshot only prints lineage for nodes it is about to show: an
+// intent's parents and yields, and the intent that produced a fact or finding.
+// Edges between other nodes are not part of that picture. An empty id list
+// does not query. Order is fixed so the injected snapshot stays stable from
+// round to round.
+func (s *ExplorationStore) LineageEdges(ids []int64) ([]Edge, error) {
+	uniq := uniquePositiveIDs(ids)
+	if len(uniq) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`
+		SELECT src_id, rel, dst_id
+		FROM exploration_edges
+		WHERE exploration_id=$1
+		  AND rel = ANY($2::text[])
+		  AND (src_id = ANY($3::bigint[]) OR dst_id = ANY($3::bigint[]))
+		ORDER BY src_id, rel, dst_id`,
+		s.expID,
+		[]string{RelDerivedFrom, RelSpawns, RelYields},
+		uniq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEdges(rows)
+}
+
+func uniquePositiveIDs(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func scanEdges(rows *sql.Rows) ([]Edge, error) {
 	var out []Edge
 	for rows.Next() {
 		var e Edge

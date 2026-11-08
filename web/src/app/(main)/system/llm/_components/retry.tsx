@@ -229,7 +229,7 @@ export function RetryRuleFields({
   );
 }
 
-/** 模型配置抽屉里的三层覆盖（跟着端点走的那三层）。 */
+/** 提供商抽屉里的三层覆盖。这三层跟着连接走，所以同一提供商下的模型共用。 */
 export function ProfileRetryFields({
   value,
   onChange,
@@ -242,8 +242,8 @@ export function ProfileRetryFields({
       <div className="grid gap-0.5">
         <Label className="text-sm">重试覆盖</Label>
         <p className="text-muted-foreground text-xs">
-          只对这个配置生效，覆盖「重试与退避」里的全局默认。每格留空 = 跟随全局；次数填 -1 = 关掉这层重试；
-          间隔填了就用固定间隔取代指数退避。熔断与意图重跑是进程级的，只能在全局那页调。
+          对这个提供商下的所有模型生效，覆盖「重试与退避」里的全局默认。每格留空 = 跟随全局；次数填 -1 =
+          关掉这层重试；间隔填了就用固定间隔取代指数退避。熔断与意图重跑是进程级的，只能在全局那页调。
         </p>
       </div>
       {(["connect", "empty", "stream"] as const).map((k) => (
