@@ -200,6 +200,13 @@ func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 // GIT_SSL_CAINFO→git, NODE_EXTRA_CA_CERTS→node; NODE_USE_ENV_PROXY makes Node 24+
 // honor the proxy vars. ALL_PROXY is set too so a socks5 egress proxy (which curl
 // only reads from ALL_PROXY, not HTTP(S)_PROXY) works in the capture-off path.
+//
+// NO_PROXY is (re)set explicitly: os/exec dedups env by key keeping the LAST
+// entry, so our value overrides whatever the host process inherited — otherwise
+// a host-side NO_PROXY=* would make every child skip the proxy entirely
+// (全局代理被整体绕过). Loopback stays direct in both capture modes: a remote
+// egress proxy cannot reach this host's loopback services, so routing them
+// through it would break CTF/target-on-localhost setups.
 // Empty proxyAddr → nil (direct, unchanged env).
 func proxyEnv(proxyAddr, caCert string) []string {
 	if proxyAddr == "" {
@@ -209,6 +216,7 @@ func proxyEnv(proxyAddr, caCert string) []string {
 		"HTTP_PROXY=" + proxyAddr, "HTTPS_PROXY=" + proxyAddr,
 		"http_proxy=" + proxyAddr, "https_proxy=" + proxyAddr,
 		"ALL_PROXY=" + proxyAddr, "all_proxy=" + proxyAddr, // socks5 egress: curl reads only this
+		"NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1", // 覆盖继承值；回环直连本机
 		"NODE_USE_ENV_PROXY=1", // Node 24+: honor HTTP(S)_PROXY in built-in fetch/http
 	}
 	if caCert != "" {

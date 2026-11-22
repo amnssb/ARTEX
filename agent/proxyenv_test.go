@@ -28,6 +28,14 @@ func TestProxyEnvSetsAllProxyForSocks5(t *testing.T) {
 			t.Errorf("proxyEnv missing %s: %v", want, env)
 		}
 	}
+	// An inherited NO_PROXY (e.g. NO_PROXY=* on the host) would let every child
+	// skip the proxy entirely; proxyEnv must override it, keeping only loopback
+	// direct (a remote egress proxy can't reach this host's loopback services).
+	for _, want := range []string{"NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1"} {
+		if !has(want) {
+			t.Errorf("proxyEnv missing %s (inherited NO_PROXY would bypass the proxy): %v", want, env)
+		}
+	}
 	if has("SSL_CERT_FILE=") || has("CURL_CA_BUNDLE=") {
 		t.Errorf("proxyEnv without CA must not inject CA vars: %v", env)
 	}

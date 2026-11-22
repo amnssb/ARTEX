@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -442,7 +443,7 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
 	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
-	if tr := s.httpProxyTransport(spec); tr != nil {
+	if tr := s.httpProxyTransport(spec, rawURL); tr != nil {
 		client.Transport = tr
 	}
 	resp, err := client.Do(req)
@@ -457,14 +458,24 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 }
 
 // httpProxyTransport builds a Transport for the http tool's proxy config, or nil
-// (direct). use_recording_proxy routes through the recording proxy + trusts its CA.
-func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
+// (direct). Resolution order: 显式 proxy 配置 → use_recording_proxy（记录代理）→
+// 全局出口代理。前两级为空时不再直连：http 工具是 agent 可自建的自助出网口，静默
+// 直连等于给「全局代理绕过」留门——默认复用 Manager.ProxyAddr 的同一套出口逻辑
+// （捕获开=记录代理、捕获关=全局代理；都未配则仍是直连，与 Bash env 行为一致）。
+// loopback 目标不经代理：远端出口代理够不到本机的回环服务，直连才能打本地靶机。
+func (s *Server) httpProxyTransport(spec httpExec, reqURL string) *http.Transport {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
 	if spec.UseRecordingProxy {
 		if addr := s.m.ProxyAddr(); addr != "" {
 			proxyStr = "http://" + addr
 			caFile = s.m.ProxyCACert()
+		}
+	}
+	if proxyStr == "" && !isLoopbackURL(reqURL) {
+		if addr := s.m.ProxyAddr(); addr != "" {
+			proxyStr = addr
+			caFile = s.m.ProxyCACert() // 捕获开=MITM 重签证书，需信任其 CA
 		}
 	}
 	if proxyStr == "" {
@@ -484,6 +495,26 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 		}
 	}
 	return tr
+}
+
+// isLoopbackURL reports whether the request targets this host's loopback
+// (localhost / 127.x / ::1), which must bypass the egress proxy.
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname() // strips port; IPv6 literals come back bracket-free
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // ---------- helpers ----------

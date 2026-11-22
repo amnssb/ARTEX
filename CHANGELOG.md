@@ -6,6 +6,12 @@
 
 ## [Unreleased]
 
+### 全局代理
+
+#### 修复的问题
+
+- **堵住全局代理被绕过的三个口子**：① Bash 子进程环境此前会继承宿主机的 `NO_PROXY`（如 `NO_PROXY=*`），代理变量配了也等于没配——`proxyEnv` 现在显式覆写 `NO_PROXY/no_proxy`，只保留回环地址直连（远端出口代理够不到本机回环服务，本地靶机不受影响）。② 自定义 http 类工具不填代理、不开「走记录代理」时会静默直连，agent 甚至能自建一个 http 工具直接出网——现在默认复用 `Manager.ProxyAddr` 的同一套出口逻辑（捕获开=记录代理、捕获关=全局代理），回环目标仍直连。③ 新增五条内置拦截规则（env unset/清空代理变量、`curl --noproxy`、`trust_env=False`、注入 `NO_PROXY=*`、undici `setGlobalDispatcher` 置空），agent 显式绕过出口代理的调用直接 deny——这类行为是治理规避而非目标侧技术，规则可在「系统 → 命令拦截」停用或删除。
+
 ### 模型
 
 #### 新增的功能

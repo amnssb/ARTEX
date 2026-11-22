@@ -279,6 +279,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV4(); err != nil {
+		return fmt.Errorf("seed intercept rules v4: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -614,4 +617,72 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		return fmt.Errorf("rule %q: %w", name, err)
 	}
 	return d.SetSetting("intercept_default_rules_v3", "done")
+}
+
+// proxyBypassPatterns are the built-in rules that deny a tool call explicitly
+// escaping the egress proxy (全局代理绕过). The platform routes every target
+// request through the recording/global proxy — both for IP/traffic governance and
+// for the audit trail — so a call that unsets the proxy vars, empties them for one
+// command, opts out via --noproxy/NO_PROXY, or turns off requests' trust_env is
+// governance evasion, not a target-side technique, and is denied outright.
+// Each pattern targets ONE mechanism so the message can name it precisely.
+// Exported as package consts only so the seeded regexes are unit-testable without a DB.
+const (
+	// env 变量操作面：unset/清空任一代理变量（unset HTTP_PROXY、HTTP_PROXY= curl、
+	// env -u …、export HTTP_PROXY=）。大小写变体与 http/https/all/no 三组都要覆盖。
+	proxyBypassUnsetPattern = `(?i)(?:\b(?:unset|env\s+(?:-u\s+|--unset=)|export)\b[^;\n|&]{0,120}\b(?:https?_proxy|all_proxy|no_proxy)\b|(?:https?_proxy|all_proxy|no_proxy)=\"?\s*(?:curl|wget|python\d?|node|npm|pip\d?|go|git)\b)`
+	// curl/wget 的显式不代理参数：--noproxy / --no-proxy，含 '*' 通配或任意主机列表。
+	proxyBypassNoproxyPattern = `(?i)\b(?:curl|wget)\b[^|\n&;]{0,200}(?:--noproxy|--no-proxy)\b`
+	// python requests/httpx 关闭环境代理读取：trust_env=False（绕过 requests/httpx）。
+	proxyBypassTrustEnvPattern = `(?i)\btrust_env\s*=\s*False\b`
+	// node fetch/undici 的全局 dispatcher 置空（绕过 NODE_USE_ENV_PROXY 注入的代理）。
+	proxyBypassDispatcherPattern = `(?i)setGlobalDispatcher\s*\(\s*new\s+(?:undici\.)?(?:Agent|ProxyAgent)\s*\(\s*(?:\{\s*\}|undefined|null)?\s*\)`
+	// 在子进程环境里重新注入 NO_PROXY（含 '*'）把已配好的代理豁免掉。
+	proxyBypassNoProxyPattern = `(?i)\b(?:NO_PROXY|no_proxy)\s*=\s*["']?\*`
+)
+
+func (d *DB) seedDefaultInterceptRulesV4() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v4"); v == "done" {
+		return nil
+	}
+	rules := []struct {
+		name, pattern, message string
+	}{
+		{
+			name:    "[内置] 显式绕过出口代理（env 操作）",
+			pattern: proxyBypassUnsetPattern,
+			message: "禁止 unset/清空代理环境变量绕过出口代理——所有目标流量必须经平台出口代理（治理与留痕要求，非目标防御）",
+		},
+		{
+			name:    "[内置] 显式绕过出口代理（curl/wget --noproxy）",
+			pattern: proxyBypassNoproxyPattern,
+			message: "禁止 --noproxy/--no-proxy 绕过出口代理——所有目标流量必须经平台出口代理（治理与留痕要求，非目标防御）",
+		},
+		{
+			name:    "[内置] 显式绕过出口代理（trust_env=False）",
+			pattern: proxyBypassTrustEnvPattern,
+			message: "禁止 trust_env=False 绕过出口代理——requests/httpx 必须读取环境代理（治理与留痕要求，非目标防御）",
+		},
+		{
+			name:    "[内置] 显式绕过出口代理（NO_PROXY=*）",
+			pattern: proxyBypassNoProxyPattern,
+			message: "禁止注入 NO_PROXY=* 豁免出口代理——所有目标流量必须经平台出口代理（治理与留痕要求，非目标防御）",
+		},
+		{
+			name:    "[内置] 显式绕过出口代理（undici dispatcher 置空）",
+			pattern: proxyBypassDispatcherPattern,
+			message: "禁止 setGlobalDispatcher 置空代理绕过出口代理——所有目标流量必须经平台出口代理（治理与留痕要求，非目标防御）",
+		},
+	}
+	for _, r := range rules {
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+SELECT $1, true, 85, 'tool_input', 'regex', $2, 'deny', $3, false, 60, 'deny'
+WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
+			r.name, r.pattern, r.message,
+		); err != nil {
+			return fmt.Errorf("rule %q: %w", r.name, err)
+		}
+	}
+	return d.SetSetting("intercept_default_rules_v4", "done")
 }
