@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/cve"
 	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -107,7 +108,14 @@ type ToolSet struct {
 	// the planner having to spot it folded into the graph overview. Wired for the main
 	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
 	notifyHint func(texts []string)
+	// cveCfg, when non-nil, enables the cve_search tool with these outbound
+	// settings (NVD proxy/CA from the web-search config). nil = tool not offered.
+	cveCfg *cve.Config
 }
+
+// SetCVE wires the cve_search tool's outbound config (proxy/CA mirror the
+// web-search settings). nil disables the tool.
+func (t *ToolSet) SetCVE(cfg *cve.Config) { t.cveCfg = cfg }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
 // by the main-agent chat, so runtime-added goals are announced to the planner by name.
@@ -921,6 +929,41 @@ func compactFinding(n *db.Node) map[string]any {
 		m["severity"] = sv
 	}
 	return m
+}
+
+// cveSearchToolName is the read-only CVE reference tool's registry name.
+const cveSearchToolName = "cve_search"
+
+// cveSearch queries public CVE databases (NVD API 2.0) for reference info on a
+// keyword (product/component) or a specific CVE id. It is a RESEARCH aid: a hit
+// is a lead to verify by actually exploiting the target — never a reportable
+// finding (that red line lives in the worker prompt and in cve.Result.Note).
+func (t *ToolSet) cveSearch() actool.CoreTool {
+	return readTool(cveSearchToolName, "按关键词（产品/组件/版本）或 CVE 编号查公共漏洞库(NVD)，返回 id/严重级别/CVSS/CWE/受影响产品/补丁与利用参考链接。**用途**：把指纹/版本匹配到的候选 CVE 作为【探索线索】——记录时必须 record_fact(confidence=inferred)，并设计利用路径去实际验证；命中不等于可利用，禁止直接 report_finding。Web 应用逻辑类漏洞（SQLi/越权/逻辑缺陷）不在 CVE 体系里，改走实际探测。",
+		obj(map[string]any{
+			"query": str("CVE 编号（如 CVE-2021-44228）或产品关键词（如 jenkins、log4j 2.14）"),
+			"limit": intp("返回条数，默认 5，上限 20"),
+		}), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			if t.cveCfg == nil {
+				return actool.Errorf("cve_search 未启用：请在「系统 → 系统配置」开启 CVE 检索"), nil
+			}
+			var a struct {
+				Query string `json:"query"`
+				Limit int    `json:"limit"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			q := cve.Query{Keyword: a.Query}
+			if cve.IsCVEID(a.Query) {
+				q = cve.Query{CVEID: a.Query}
+			}
+			res, err := cve.Search(ctx, *t.cveCfg, q, a.Limit)
+			if err != nil {
+				return actool.Errorf("CVE 检索失败: " + err.Error()), nil
+			}
+			return jsonResult(res)
+		})
 }
 
 func (t *ToolSet) listFindings() actool.CoreTool {
@@ -2075,5 +2118,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// cve_search：指纹/版本命中后查候选 CVE，派【带验证路径的意图】去实际触发（inferred 线索，不是 finding）。
+		t.cveSearch(),
 	}
 }

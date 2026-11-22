@@ -218,7 +218,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
-		domainReg := buildDomainReg(m.Assets())
+		domainReg := buildDomainReg(m.Assets(), m)
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
@@ -472,6 +472,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
+	s.chatAgent.SetCVE(s.m.CVEConfig()) // cve_search 出网配置(nil=关闭)
 	s.chatAgent.SetGuard(s.chatGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
@@ -3314,6 +3315,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"brave_key_set":            strings.TrimSpace(braveKey) != "",
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
 		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
+		"cve_search_enabled":       s.m.CVEConfig() != nil,      // CVE 检索(cve_search 工具)开关；NVD 出网复用 web_search_proxy
 		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
@@ -3386,6 +3388,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		BraveKey         *string `json:"brave_search_api_key"`
 		TavilyKey        *string `json:"tavily_search_api_key"`
 		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
+		CVESearchEnabled *bool   `json:"cve_search_enabled"` // cve_search 工具开关；需重建 agent 生效
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
 		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
@@ -3540,6 +3543,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		changed = true // capture-off egress is baked into agents at build time → rebuild
+	}
+	if req.CVESearchEnabled != nil {
+		if err := s.m.SetCVESearch(*req.CVESearchEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		changed = true // 工具集变化 → 重建 agent 才生效
 	}
 	if req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil {
 		// Fill unspecified fields from current state so a partial PUT doesn't reset them.

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/cve"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
@@ -240,6 +241,10 @@ type Manager struct {
 	braveKey         string
 	tavilyKey        string
 	webSearchProxy   string
+	// cveSearchOn toggles the cve_search tool (NVD lookup). Default off. Outbound
+	// requests reuse webSearchProxy (its dedicated egress proxy, empty = direct) —
+	// a separate proxy knob for one NVD client would be a second place to misconfigure.
+	cveSearchOn bool
 	// globalProxy is the egress proxy all target traffic routes through
 	// (http/https/socks5, optional user:pass). Empty = direct. When traffic
 	// capture is on it becomes the MITM's upstream; when capture is off it is
@@ -256,6 +261,9 @@ const (
 	settingBraveKey            = "brave_search_api_key"
 	settingTavilyKey           = "tavily_search_api_key"
 	settingWebSearchProxy      = "web_search_proxy"
+	// settingCVESearchOn toggles the cve_search tool (default off). Outbound NVD
+	// requests reuse webSearchProxy.
+	settingCVESearchOn = "cve_search_enabled"
 	// settingGlobalProxy is the global egress proxy for all target traffic
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
@@ -428,6 +436,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if v, ok, _ := pg.GetSetting(settingWebSearchProxy); ok {
 		m.webSearchProxy = v
 	}
+	m.cveSearchOn = pg.GetBool(settingCVESearchOn, false)
 	// Global egress proxy (default: direct). When capture is on, feed it to the
 	// MITM as its upstream so recorded traffic exits through it; when capture is
 	// off, ProxyAddr hands it to agents directly (bash env / WebFetch).
@@ -546,6 +555,30 @@ func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, proxy stri
 		backend = defaultWebSearchBackend
 	}
 	return m.webSearchOn, backend, m.braveKey, m.tavilyKey, m.webSearchProxy
+}
+
+// CVEConfig returns the cve_search tool's outbound config when enabled, or nil
+// when off (tool not offered). NVD requests reuse the web-search proxy so one
+// knob governs all reference lookups.
+func (m *Manager) CVEConfig() *cve.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.cveSearchOn {
+		return nil
+	}
+	return &cve.Config{Proxy: m.webSearchProxy}
+}
+
+// SetCVESearch persists and applies the cve_search toggle. Callers must rebuild
+// the agents (applyLLM) so the tool appears/disappears from the tool registry.
+func (m *Manager) SetCVESearch(on bool) error {
+	if err := m.pg.SetBool(settingCVESearchOn, on); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.cveSearchOn = on
+	m.mu.Unlock()
+	return nil
 }
 
 // WebSearchOpts returns the config as the agent-package struct the server pushes

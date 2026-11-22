@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/Autumn-27/artex/cve"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
@@ -28,6 +29,7 @@ type MainAgent struct {
 	proxyAddr       string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert     string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch       WebSearchOpts                          // web_search tool backend selection (off by default)
+	cveCfg          *cve.Config                            // cve_search tool outbound config (nil = tool off)
 	workDir         string                                 // shared work dir (surfaced in prompt as artifact-output target)
 	steerWork       func(intentID int64, msg string) error // engine callback: steer a running work (nil = off)
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
@@ -76,6 +78,9 @@ func (m *MainAgent) SetProxy(addr, caCert string) { m.proxyAddr, m.proxyCACert =
 
 // SetWebSearch selects the web_search backend for the main agent (off by default).
 func (m *MainAgent) SetWebSearch(o WebSearchOpts) { m.webSearch = o }
+
+// SetCVE selects the cve_search outbound config for the main agent (nil = off).
+func (m *MainAgent) SetCVE(cfg *cve.Config) { m.cveCfg = cfg }
 
 // SetSteerWork wires the engine callback that lets the main agent's steer_work
 // tool inject a mid-run course-correction into a running work (nil = tool off).

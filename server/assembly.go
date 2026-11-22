@@ -336,19 +336,23 @@ func contains(ss []string, v string) bool {
 // buildDomainReg builds a name→CoreTool registry from a server-level ToolSet
 // (real AssetStore, nil ExplorationStore, taskID=0). Used by ToolResolve to inject
 // domain tools into agents (Auto, custom) that don't own a per-task ToolSet.
-// nil as → returns nil (no injection, graceful degradation).
+// nil as → returns nil (no injection, graceful degradation). m supplies the
+// cve_search outbound config (its CVEConfig() is nil when the toggle is off).
 //
 // The nil ExplorationStore is deliberate — these instances are task-less by
 // construction — so every tool here must tolerate it. Asset/company tools do
 // (they only need the AssetStore); the exploration-graph tools refuse with a
 // clear message via ToolSet.needExploration. Binding one of them to a task-less
 // agent in the tools table is therefore a useless tool, not a crash.
-func buildDomainReg(as *db.AssetStore) map[string]actool.CoreTool {
+func buildDomainReg(as *db.AssetStore, m *Manager) map[string]actool.CoreTool {
 	if as == nil {
 		return nil
 	}
 	serverTS := agent.NewToolSet(nil, "")
 	serverTS.SetAssetStore(as, as.Companies())
+	if m != nil {
+		serverTS.SetCVE(m.CVEConfig()) // cve_search 出网配置(nil=开关关闭,工具自报不可用)
+	}
 	reg := make(map[string]actool.CoreTool)
 	for _, t := range serverTS.AllDomainTools() {
 		reg[t.Name()] = t

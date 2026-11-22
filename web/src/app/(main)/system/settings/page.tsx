@@ -21,6 +21,7 @@ export default function SystemSettingsPage() {
   const [trafficCapture, setTrafficCapture] = React.useState(false);
   const [agentTrafficBinding, setAgentTrafficBinding] = React.useState(false);
   const [webSearch, setWebSearch] = React.useState(false);
+  const [cveSearch, setCveSearch] = React.useState(false);
   const [backend, setBackend] = React.useState("ddgs");
   const [braveKeySet, setBraveKeySet] = React.useState(false);
   const [braveKeyInput, setBraveKeyInput] = React.useState("");
@@ -50,6 +51,7 @@ export default function SystemSettingsPage() {
     setTrafficCapture(!!s.traffic_capture);
     setAgentTrafficBinding(!!s.agent_traffic_binding);
     setWebSearch(!!s.web_search_enabled);
+    setCveSearch(!!s.cve_search_enabled);
     setBackend(s.web_search_backend || "ddgs");
     setBraveKeySet(!!s.brave_key_set);
     setTavilyKeySet(!!s.tavily_key_set);
@@ -615,6 +617,36 @@ export default function SystemSettingsPage() {
                 </Button>
               </div>
             )}
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <SearchIcon className="size-4" />
+              CVE 检索
+            </CardTitle>
+            <CardDescription>
+              开启后，Agent 获得 <b>cve_search</b> 工具（查公共漏洞库 NVD）：按产品关键词或 CVE 编号查候选漏洞
+              （id / 严重级别 / CVSS / CWE / 受影响产品 / 补丁与利用参考）。命中只是<b>线索</b>——Agent 被要求先记
+              inferred 事实、设计利用路径<b>实际触发</b>后才能上报漏洞，不会拿「查到 CVE」当发现。
+              <br />
+              NVD 出网复用「网络搜索」的<b>出口代理</b>配置（无需单独填）；需要重启？不用——保存后自动重建 Agent 生效。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex items-center justify-between gap-4">
+            <Label htmlFor="cve-search" className="text-sm font-normal text-muted-foreground">
+              {cveSearch ? "已开启 · cve_search 工具已注入各 Agent" : "已关闭 · Agent 无 cve_search 工具"}
+            </Label>
+            <Switch
+              id="cve-search"
+              checked={cveSearch}
+              disabled={!loaded || saving}
+              onCheckedChange={(v) => {
+                setCveSearch(v); // optimistic
+                saveWebSearch({ cve_search_enabled: v });
+              }}
+            />
           </CardContent>
         </Card>
 

@@ -6,6 +6,12 @@
 
 ## [Unreleased]
 
+### CVE 检索
+
+#### 新增的功能
+
+- **新增 cve_search 工具（查 NVD 公共漏洞库）**：「系统 → 系统配置」新增「CVE 检索」卡片（默认关）。开启后，规划者/执行者/主 Agent/自定义 Agent 都可用 `cve_search` 按产品关键词或 CVE 编号查询 NVD API 2.0，返回 id、严重级别、CVSS 评分、CWE、受影响产品（CPE）与补丁/利用参考链接。定位是**探索线索**：工具说明与返回数据都明确要求命中后先 `record_fact(confidence=inferred)`、设计利用路径实际触发，才能 `report_finding`——与「禁止把版本匹配当已确认漏洞」的既有红线一致。NVD 出网复用「网络搜索」的出口代理；开关变更走 agent 重建生效。数据源无需 API Key（NVD 公开接口，限流约 5 请求/30 秒）。
+
 ### 全局代理
 
 #### 修复的问题

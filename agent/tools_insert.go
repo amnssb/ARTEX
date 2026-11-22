@@ -655,6 +655,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// cve_search：按指纹/版本查候选 CVE 作探索线索（红线：inferred 事实，触发后才可上报）。
+		t.cveSearch(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}
@@ -678,6 +680,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// cve_search：人机对话里查 CVE 参考，派意图或加提示给任务。
+		t.cveSearch(),
 	}
 }
 

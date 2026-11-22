@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Autumn-27/artex/cve"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
@@ -31,6 +32,7 @@ type ChatAgent struct {
 	proxyAddr      string
 	proxyCACert    string
 	webSearch      WebSearchOpts
+	cveCfg         *cve.Config  // cve_search tool outbound config (nil = tool off)
 	guard          *guard.Guard // optional; nil disables intercept hooks for chat
 	nonStreamingFn func() bool  // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn   func() bool  // resolver: use experimental noa compaction? (nil = off)
@@ -69,6 +71,9 @@ func (c *ChatAgent) SetProxy(addr, caCert string) { c.proxyAddr, c.proxyCACert =
 
 // SetWebSearch selects the web_search backend for the chat agent (off by default).
 func (c *ChatAgent) SetWebSearch(o WebSearchOpts) { c.webSearch = o }
+
+// SetCVE selects the cve_search outbound config for chat conversations (nil = off).
+func (c *ChatAgent) SetCVE(cfg *cve.Config) { c.cveCfg = cfg }
 
 // SetGuard attaches a guard (with user-configured intercept rules) to this chat
 // agent. Must be called before Chat; safe to call multiple times.

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Autumn-27/artex/cve"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
@@ -33,6 +34,7 @@ type Planner struct {
 	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert       string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch         WebSearchOpts                          // web_search tool backend selection (off by default)
+	cveCfg            *cve.Config                            // cve_search tool outbound config (nil = tool off)
 	workDir           string                                 // shared work dir (surfaced in prompt as artifact-output target)
 	injectConstraints func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
 	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
@@ -94,6 +96,9 @@ func (p *Planner) SetProxy(addr, caCert string) { p.proxyAddr, p.proxyCACert = a
 
 // SetWebSearch selects the web_search backend for the planner (off by default).
 func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
+
+// SetCVE selects the cve_search outbound config for the planner (nil = off).
+func (p *Planner) SetCVE(cfg *cve.Config) { p.cveCfg = cfg }
 
 // SetConstraintInject wires a resolver deciding whether this task's operation
 // constraints get injected into the planner system prompt. Read per round so the

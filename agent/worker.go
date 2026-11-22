@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/cve"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
@@ -59,6 +60,7 @@ type Worker struct {
 	proxyAddr       string
 	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
 	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
+	cveCfg          *cve.Config       // cve_search tool outbound config (nil = tool off)
 	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
 	window          int               // context window in tokens (for compaction)
 	windowFn        func() int        // optional dynamic task-chain minimum
@@ -190,6 +192,9 @@ func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = ad
 
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
+
+// SetCVE selects the cve_search outbound config for this worker (nil = off).
+func (w *Worker) SetCVE(cfg *cve.Config) { w.cveCfg = cfg }
 
 // proxyEnv builds the Bash-subprocess env that routes child-command HTTP through
 // the egress proxy (the recording MITM when capture is on, or the global proxy
@@ -372,6 +377,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx.SetTaskID(taskID)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
+	tsx.SetCVE(w.cveCfg) // cve_search（nil=平台开关关闭，工具自报不可用）
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
