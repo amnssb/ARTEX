@@ -925,6 +925,8 @@ export interface Settings {
   web_search_proxy?: string;
   // CVE 检索（cve_search 工具，查 NVD）总开关，默认关；出网复用 web_search_proxy。
   cve_search_enabled?: boolean;
+  // 本地 CVE 库优先查询（离线优先）；本地未命中或未下载时仍兜底在线。
+  cve_local_preferred?: boolean;
   // 全局出口代理(http/https/socks5，可带 user:pass)，所有目标流量走它。开启流量捕获时作为
   // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
   global_proxy?: string;
@@ -949,6 +951,28 @@ export interface Settings {
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+}
+
+// ---- 本地 CVE 库（NVD feed 下载到 data/cve/，供离线查询） ----
+
+export interface CVEFeedInfo {
+  source: string; // 年份或 "modified"
+  records: number;
+  ingested_at: string; // RFC3339
+  sha256?: string;
+}
+
+export interface CVELocalStatus {
+  local_ready: boolean; // 本地库已下载（可离线查询）
+  records: number; // 本地记录数
+  feeds: CVEFeedInfo[] | null; // 已导入的 feed
+  downloading: boolean; // 是否有下载任务在跑
+  progress: {
+    source: string;
+    done: number;
+    phase: string; // starting|downloading|ingesting|done|error
+    error?: string;
+  };
 }
 
 // ---- 漏洞 IM 推送 ----

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/cve"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
@@ -811,6 +812,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/notify/deliveries", s.notifyListDeliveries)
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
+	// 本地 CVE 库（下载/状态/清除）。状态 GET 轮询进度；下载 POST 立即返回，
+	// 进度走状态接口；清除 DELETE 回到纯在线模式。
+	mux.HandleFunc("GET /api/settings/cve/status", s.cveStatus)
+	mux.HandleFunc("POST /api/settings/cve/download", s.cveDownload)
+	mux.HandleFunc("DELETE /api/settings/cve/local", s.cveClear)
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
@@ -3316,6 +3322,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
 		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
 		"cve_search_enabled":       s.m.CVEConfig() != nil,      // CVE 检索(cve_search 工具)开关；NVD 出网复用 web_search_proxy
+		"cve_local_preferred":      s.m.CVEConfig() != nil && s.m.CVEConfig().LocalPreferred, // 本地库优先查询(离线优先)
 		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
@@ -3373,6 +3380,42 @@ func (s *Server) pgDetectPython(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"python_interpreter": p})
 }
 
+// --- 本地 CVE 库（下载/状态/清除） ---
+
+// cveStatus returns the local CVE store snapshot for the settings page.
+func (s *Server) cveStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.m.CVEStatus())
+}
+
+// cveDownload starts one feed download (year or "modified") in the background.
+func (s *Server) cveDownload(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Source string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if !cve.ValidFeedSource(strings.TrimSpace(req.Source)) {
+		writeErr(w, 400, "source 需为年份（2024/2025/2026…）或 modified")
+		return
+	}
+	if err := s.m.DownloadCVEFeed(strings.TrimSpace(req.Source)); err != nil {
+		writeErr(w, 409, err.Error()) // 已有任务在跑 → 409 Conflict
+		return
+	}
+	writeJSON(w, 202, map[string]any{"status": "started", "source": req.Source})
+}
+
+// cveClear wipes the local CVE store (回到纯在线模式).
+func (s *Server) cveClear(w http.ResponseWriter, r *http.Request) {
+	if err := s.m.ClearCVELocal(); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "cleared"})
+}
+
 // putSettings applies a settings change. Toggling traffic_capture rebuilds the
 // agents (applyLLM) so the new proxy/traffic-tools/prompt state takes hold — when
 // off, agents get no proxy config, no traffic tools, and no proxy prompt content.
@@ -3389,6 +3432,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		TavilyKey        *string `json:"tavily_search_api_key"`
 		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
 		CVESearchEnabled *bool   `json:"cve_search_enabled"` // cve_search 工具开关；需重建 agent 生效
+		CVELocalPreferred *bool  `json:"cve_local_preferred"` // 本地库优先查询；即时生效
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
 		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
@@ -3550,6 +3594,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		changed = true // 工具集变化 → 重建 agent 才生效
+	}
+	if req.CVELocalPreferred != nil {
+		if err := s.m.SetCVELocalPreferred(*req.CVELocalPreferred); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		// 查询顺序是每次 cve_search 调用经 CVEConfig() 现读的，无需重建。
 	}
 	if req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil {
 		// Fill unspecified fields from current state so a partial PUT doesn't reset them.

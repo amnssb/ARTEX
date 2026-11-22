@@ -106,6 +106,7 @@ import type {
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
+  CVELocalStatus,
 } from "@/lib/types";
 
 function getToken(): string | null {
@@ -822,6 +823,12 @@ export const api = {
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
+
+  // 本地 CVE 库：状态轮询 / 触发一次 feed 下载(202 立即返回) / 清空本地库。
+  cveStatus: () => get<CVELocalStatus>(`/settings/cve/status`),
+  cveDownload: (source: string) =>
+    post<{ status: string; source: string }>(`/settings/cve/download`, { source }),
+  cveClear: () => del<{ status: string }>(`/settings/cve/local`),
 
   // ---- 漏洞 IM 推送 ----
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，

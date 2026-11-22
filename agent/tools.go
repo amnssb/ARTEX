@@ -939,7 +939,7 @@ const cveSearchToolName = "cve_search"
 // is a lead to verify by actually exploiting the target — never a reportable
 // finding (that red line lives in the worker prompt and in cve.Result.Note).
 func (t *ToolSet) cveSearch() actool.CoreTool {
-	return readTool(cveSearchToolName, "按关键词（产品/组件/版本）或 CVE 编号查公共漏洞库(NVD)，返回 id/严重级别/CVSS/CWE/受影响产品/补丁与利用参考链接。**用途**：把指纹/版本匹配到的候选 CVE 作为【探索线索】——记录时必须 record_fact(confidence=inferred)，并设计利用路径去实际验证；命中不等于可利用，禁止直接 report_finding。Web 应用逻辑类漏洞（SQLi/越权/逻辑缺陷）不在 CVE 体系里，改走实际探测。",
+	return readTool(cveSearchToolName, "按关键词（产品/组件/版本）或 CVE 编号查漏洞库（已下载本地库时优先查本地快照，否则查 NVD 在线接口），返回 id/严重级别/CVSS/CWE/受影响产品/补丁与利用参考链接。**用途**：把指纹/版本匹配到的候选 CVE 作为【探索线索】——记录时必须 record_fact(confidence=inferred)，并设计利用路径去实际验证；命中不等于可利用，禁止直接 report_finding。Web 应用逻辑类漏洞（SQLi/越权/逻辑缺陷）不在 CVE 体系里，改走实际探测。",
 		obj(map[string]any{
 			"query": str("CVE 编号（如 CVE-2021-44228）或产品关键词（如 jenkins、log4j 2.14）"),
 			"limit": intp("返回条数，默认 5，上限 20"),

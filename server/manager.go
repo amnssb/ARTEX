@@ -1,11 +1,14 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -245,6 +248,15 @@ type Manager struct {
 	// requests reuse webSearchProxy (its dedicated egress proxy, empty = direct) —
 	// a separate proxy knob for one NVD client would be a second place to misconfigure.
 	cveSearchOn bool
+	// cveLocalPreferred: cve_search queries the local store first, online NVD as
+	// fallback (offline-first deployments). Default false = online-first.
+	cveLocalPreferred bool
+	// cveLocal is the local CVE database (data/cve/local.sqlite), nil until the
+	// first download. Downloads run under cveDlMu; progress is published to
+	// cveDlState for the settings-page status card.
+	cveLocal   *cve.LocalStore
+	cveDlMu    sync.Mutex
+	cveDlState cve.IngestProgress
 	// globalProxy is the egress proxy all target traffic routes through
 	// (http/https/socks5, optional user:pass). Empty = direct. When traffic
 	// capture is on it becomes the MITM's upstream; when capture is off it is
@@ -264,6 +276,10 @@ const (
 	// settingCVESearchOn toggles the cve_search tool (default off). Outbound NVD
 	// requests reuse webSearchProxy.
 	settingCVESearchOn = "cve_search_enabled"
+	// settingCVELocalPreferred makes cve_search query the local database first
+	// (offline-first); when the local store misses (or is empty) it still falls
+	// back to the online NVD API. Default false = online-first (freshest data).
+	settingCVELocalPreferred = "cve_local_preferred"
 	// settingGlobalProxy is the global egress proxy for all target traffic
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
@@ -437,6 +453,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		m.webSearchProxy = v
 	}
 	m.cveSearchOn = pg.GetBool(settingCVESearchOn, false)
+	m.cveLocalPreferred = pg.GetBool(settingCVELocalPreferred, false)
 	// Global egress proxy (default: direct). When capture is on, feed it to the
 	// MITM as its upstream so recorded traffic exits through it; when capture is
 	// off, ProxyAddr hands it to agents directly (bash env / WebFetch).
@@ -559,14 +576,32 @@ func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, proxy stri
 
 // CVEConfig returns the cve_search tool's outbound config when enabled, or nil
 // when off (tool not offered). NVD requests reuse the web-search proxy so one
-// knob governs all reference lookups.
+// knob governs all reference lookups. Local carries the local store handle when
+// one has been downloaded; LocalPreferred flips the lookup order (local first,
+// online NVD fallback).
 func (m *Manager) CVEConfig() *cve.Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if !m.cveSearchOn {
 		return nil
 	}
-	return &cve.Config{Proxy: m.webSearchProxy}
+	return &cve.Config{
+		Proxy:           m.webSearchProxy,
+		Local:           m.cveLocal,
+		LocalPreferred:  m.cveLocalPreferred,
+	}
+}
+
+// SetCVELocalPreferred persists the local-first lookup toggle. Only affects
+// cve_search behavior; no agent rebuild needed (the resolver reads per call).
+func (m *Manager) SetCVELocalPreferred(on bool) error {
+	if err := m.pg.SetBool(settingCVELocalPreferred, on); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.cveLocalPreferred = on
+	m.mu.Unlock()
+	return nil
 }
 
 // SetCVESearch persists and applies the cve_search toggle. Callers must rebuild
@@ -579,6 +614,115 @@ func (m *Manager) SetCVESearch(on bool) error {
 	m.cveSearchOn = on
 	m.mu.Unlock()
 	return nil
+}
+
+// cveLocalDir is the local CVE store directory under the data root. The data
+// dir is gitignored (/.gitignore lists /data/), so the database file never
+// lands in the repo; deleting the directory reverts to online-only mode.
+func (m *Manager) cveLocalDir() string { return filepath.Join(m.dir, "cve") }
+
+// CVEStatus is the settings-page status snapshot for the local CVE store.
+type CVEStatus struct {
+	LocalReady bool           `json:"local_ready"` // 本地库已下载（可离线查询）
+	Records    int            `json:"records"`     // 本地记录数
+	Feeds      []cve.FeedInfo `json:"feeds"`       // 已导入的 feed（source/时间/条数）
+	Downloading bool          `json:"downloading"` // 当前是否有下载任务在跑
+	Progress   cve.IngestProgress `json:"progress"` // 下载进度（Downloading=true 时有意义）
+}
+
+// CVEStatus reports the local store's state (safe when never downloaded).
+func (m *Manager) CVEStatus() CVEStatus {
+	m.cveDlMu.Lock()
+	st := m.cveDlState
+	m.cveDlMu.Unlock()
+	out := CVEStatus{
+		Downloading: st.Phase != "" && st.Phase != "done" && st.Phase != "error",
+		Progress:    st,
+	}
+	m.mu.RLock()
+	local := m.cveLocal
+	m.mu.RUnlock()
+	if local != nil {
+		ctx := context.Background()
+		if n, err := local.Count(ctx); err == nil {
+			out.LocalReady = true
+			out.Records = n
+			if feeds, ferr := local.Feeds(ctx); ferr == nil {
+				out.Feeds = feeds
+			}
+		}
+	}
+	return out
+}
+
+// DownloadCVEFeed ingests one feed source (year or "modified") in the
+// background; progress lands in cveDlState for CVEStatus. Concurrent downloads
+// are serialized; a second call while one runs reports busy via its error.
+func (m *Manager) DownloadCVEFeed(source string) error {
+	m.cveDlMu.Lock()
+	if m.cveDlState.Phase != "" && m.cveDlState.Phase != "done" && m.cveDlState.Phase != "error" {
+		m.cveDlMu.Unlock()
+		return fmt.Errorf("已有下载任务在进行中（%s），请等待完成", m.cveDlState.Source)
+	}
+	proxy := ""
+	m.mu.RLock()
+	proxy = m.webSearchProxy
+	m.mu.RUnlock()
+	m.cveDlState = cve.IngestProgress{Source: source, Phase: "starting"}
+
+	go func() {
+		defer func() {
+			m.cveDlMu.Lock()
+			if m.cveDlState.Phase == "" || m.cveDlState.Phase == "starting" || m.cveDlState.Phase == "downloading" || m.cveDlState.Phase == "ingesting" {
+				m.cveDlState.Phase = "error"
+				m.cveDlState.Error = "下载任务异常结束"
+			}
+			m.cveDlMu.Unlock()
+		}()
+		local, err := cve.OpenLocal(m.cveLocalDir())
+		if err != nil {
+			m.cveDlMu.Lock()
+			m.cveDlState = cve.IngestProgress{Source: source, Phase: "error", Error: err.Error()}
+			m.cveDlMu.Unlock()
+			return
+		}
+		m.mu.Lock()
+		m.cveLocal = local
+		m.mu.Unlock()
+
+		hc := &http.Client{Timeout: 10 * time.Minute}
+		if p := strings.TrimSpace(proxy); p != "" {
+			if pu, err := url.Parse(p); err == nil {
+				hc.Transport = &http.Transport{Proxy: http.ProxyURL(pu)}
+			}
+		}
+		_, err = local.Ingest(context.Background(), hc, source, func(p cve.IngestProgress) {
+			m.cveDlMu.Lock()
+			m.cveDlState = p
+			m.cveDlMu.Unlock()
+		})
+		if err != nil {
+			m.cveDlMu.Lock()
+			prev := m.cveDlState.Done // 保留最后已知的已导入条数
+			m.cveDlState = cve.IngestProgress{Source: source, Phase: "error", Error: err.Error(), Done: prev}
+			m.cveDlMu.Unlock()
+			log.Printf("[cve] feed %s 下载失败: %v", source, err)
+		}
+	}()
+	m.cveDlMu.Unlock()
+	return nil
+}
+
+// ClearCVELocal deletes every local record (回到纯在线模式). The store handle
+// stays open; the file is truncated in place.
+func (m *Manager) ClearCVELocal() error {
+	m.mu.RLock()
+	local := m.cveLocal
+	m.mu.RUnlock()
+	if local == nil {
+		return nil
+	}
+	return local.Clear(context.Background())
 }
 
 // WebSearchOpts returns the config as the agent-package struct the server pushes
@@ -838,6 +982,9 @@ func (m *Manager) Close() error {
 	defer m.mu.Unlock()
 	if m.traffic != nil {
 		m.traffic.Close()
+	}
+	if m.cveLocal != nil {
+		m.cveLocal.Close()
 	}
 	return m.pg.Close()
 }

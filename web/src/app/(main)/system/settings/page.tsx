@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
 import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSendMode } from "@/lib/chat-send-mode";
-import type { Settings } from "@/lib/types";
+import type { CVEFeedInfo, CVELocalStatus, Settings } from "@/lib/types";
 
 import { UpdateCard } from "./_components/update-card";
 
@@ -22,6 +22,13 @@ export default function SystemSettingsPage() {
   const [agentTrafficBinding, setAgentTrafficBinding] = React.useState(false);
   const [webSearch, setWebSearch] = React.useState(false);
   const [cveSearch, setCveSearch] = React.useState(false);
+  const [cveLocalPreferred, setCveLocalPreferred] = React.useState(false);
+  const [cveLocalReady, setCveLocalReady] = React.useState(false);
+  const [cveRecords, setCveRecords] = React.useState(0);
+  const [cveFeeds, setCveFeeds] = React.useState<CVEFeedInfo[]>([]);
+  const [cveDownloading, setCveDownloading] = React.useState(false);
+  const [cveProgress, setCveProgress] = React.useState<CVELocalStatus["progress"]>({ source: "", done: 0, phase: "" });
+  const [cveFeedSource, setCveFeedSource] = React.useState("modified");
   const [backend, setBackend] = React.useState("ddgs");
   const [braveKeySet, setBraveKeySet] = React.useState(false);
   const [braveKeyInput, setBraveKeyInput] = React.useState("");
@@ -52,6 +59,7 @@ export default function SystemSettingsPage() {
     setAgentTrafficBinding(!!s.agent_traffic_binding);
     setWebSearch(!!s.web_search_enabled);
     setCveSearch(!!s.cve_search_enabled);
+    setCveLocalPreferred(!!s.cve_local_preferred);
     setBackend(s.web_search_backend || "ddgs");
     setBraveKeySet(!!s.brave_key_set);
     setTavilyKeySet(!!s.tavily_key_set);
@@ -108,6 +116,48 @@ export default function SystemSettingsPage() {
       .catch(() => undefined)
       .finally(() => setLoaded(true));
   }, [apply]);
+
+  // 本地 CVE 库状态：有下载任务在跑时每 2 秒轮询进度；空闲时只在进入页面拉一次。
+  const refreshCveStatus = React.useCallback(() => {
+    api
+      .cveStatus()
+      .then((st) => {
+        setCveLocalReady(st.local_ready);
+        setCveRecords(st.records);
+        setCveFeeds(st.feeds ?? []);
+        setCveDownloading(st.downloading);
+        setCveProgress(st.progress);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  React.useEffect(() => {
+    refreshCveStatus();
+    if (!cveDownloading) return;
+    const t = setInterval(refreshCveStatus, 2000);
+    return () => clearInterval(t);
+  }, [refreshCveStatus, cveDownloading]);
+
+  const startCveDownload = (source: string) => {
+    api
+      .cveDownload(source)
+      .then(() => {
+        setCveDownloading(true);
+        setCveProgress({ source, done: 0, phase: "starting" });
+        toast.success(`已开始下载 ${source} feed`);
+      })
+      .catch((e) => toast.error("启动下载失败：" + (e as Error).message));
+  };
+
+  const clearCveLocal = () => {
+    api
+      .cveClear()
+      .then(() => {
+        toast.success("本地库已清除（回到纯在线模式）");
+        refreshCveStatus();
+      })
+      .catch((e) => toast.error("清除失败：" + (e as Error).message));
+  };
 
   const toggleTraffic = (v: boolean) => {
     setTrafficCapture(v); // optimistic
@@ -627,26 +677,97 @@ export default function SystemSettingsPage() {
               CVE 检索
             </CardTitle>
             <CardDescription>
-              开启后，Agent 获得 <b>cve_search</b> 工具（查公共漏洞库 NVD）：按产品关键词或 CVE 编号查候选漏洞
+              开启后，Agent 获得 <b>cve_search</b> 工具（查漏洞库）：按产品关键词或 CVE 编号查候选漏洞
               （id / 严重级别 / CVSS / CWE / 受影响产品 / 补丁与利用参考）。命中只是<b>线索</b>——Agent 被要求先记
               inferred 事实、设计利用路径<b>实际触发</b>后才能上报漏洞，不会拿「查到 CVE」当发现。
               <br />
-              NVD 出网复用「网络搜索」的<b>出口代理</b>配置（无需单独填）；需要重启？不用——保存后自动重建 Agent 生效。
+              在线查 NVD 复用「网络搜索」的<b>出口代理</b>（无需单独填）；也可把 NVD feed <b>下载到本地</b>
+              （存于 data/cve/，不进代码仓库），内网/离线环境也能查。
             </CardDescription>
           </CardHeader>
-          <CardContent className="flex items-center justify-between gap-4">
-            <Label htmlFor="cve-search" className="text-sm font-normal text-muted-foreground">
-              {cveSearch ? "已开启 · cve_search 工具已注入各 Agent" : "已关闭 · Agent 无 cve_search 工具"}
-            </Label>
-            <Switch
-              id="cve-search"
-              checked={cveSearch}
-              disabled={!loaded || saving}
-              onCheckedChange={(v) => {
-                setCveSearch(v); // optimistic
-                saveWebSearch({ cve_search_enabled: v });
-              }}
-            />
+          <CardContent className="flex flex-col gap-4">
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="cve-search" className="text-sm font-normal text-muted-foreground">
+                {cveSearch ? "已开启 · cve_search 工具已注入各 Agent" : "已关闭 · Agent 无 cve_search 工具"}
+              </Label>
+              <Switch
+                id="cve-search"
+                checked={cveSearch}
+                disabled={!loaded || saving}
+                onCheckedChange={(v) => {
+                  setCveSearch(v); // optimistic
+                  saveWebSearch({ cve_search_enabled: v });
+                }}
+              />
+            </div>
+
+            {/* 本地库区块：下载 NVD feed 到 data/cve/（SQLite）。开启总开关后才有意义。 */}
+            {cveSearch && (
+              <div className="flex flex-col gap-3 border-t pt-4">
+                <div className="flex items-center justify-between gap-4">
+                  <Label htmlFor="cve-local-preferred" className="text-sm font-normal text-muted-foreground">
+                    本地库优先{cveLocalReady ? ` · 已下载 ${cveRecords.toLocaleString()} 条` : " · 未下载"}
+                    {cveLocalPreferred ? "（本地未命中再查在线）" : "（在线优先，失败时兜底本地）"}
+                  </Label>
+                  <Switch
+                    id="cve-local-preferred"
+                    checked={cveLocalPreferred}
+                    disabled={!loaded || saving}
+                    onCheckedChange={(v) => {
+                      setCveLocalPreferred(v);
+                      saveWebSearch({ cve_local_preferred: v });
+                    }}
+                  />
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Select value={cveFeedSource} onValueChange={setCveFeedSource}>
+                    <SelectTrigger id="cve-feed-source" className="w-44">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {["2023", "2024", "2025", "2026", "modified"].map((s) => (
+                        <SelectItem key={s} value={s}>
+                          {s === "modified" ? "modified（近 8 天改动）" : `${s} 年全量`}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    variant="outline"
+                    onClick={() => startCveDownload(cveFeedSource)}
+                    disabled={!loaded || cveDownloading}
+                  >
+                    下载到本地
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={clearCveLocal}
+                    disabled={!loaded || cveDownloading || !cveLocalReady}
+                  >
+                    清除本地库
+                  </Button>
+                </div>
+
+                {cveDownloading && (
+                  <p className="text-muted-foreground text-xs">
+                    正在处理 <b>{cveProgress.source}</b>：{cveProgress.phase === "downloading" ? "下载中…" : `已导入 ${cveProgress.done.toLocaleString()} 条`}（可离开本页，任务在后台继续）
+                  </p>
+                )}
+                {cveProgress.phase === "error" && (
+                  <p className="text-destructive text-xs">下载失败：{cveProgress.error || "未知错误"}</p>
+                )}
+                {!cveDownloading && cveFeeds.length > 0 && (
+                  <p className="text-muted-foreground text-xs">
+                    已导入：
+                    {cveFeeds.map((f) => ` ${f.source}（${f.records.toLocaleString()} 条 · ${new Date(f.ingested_at).toLocaleString()}）`).join("，")}
+                  </p>
+                )}
+                <p className="text-muted-foreground text-xs">
+                  数据文件在运行数据目录 data/cve/ 下（已 gitignore，不会进仓库）；删除目录或点「清除本地库」即回到纯在线模式。
+                </p>
+              </div>
+            )}
           </CardContent>
         </Card>
 

@@ -28,10 +28,17 @@ import (
 var nvdEndpoint = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 // Config carries the outbound settings the server pushes in (mirrors the
-// web-search proxy config; empty = direct).
+// web-search proxy config; empty = direct). Local, when set, routes searches
+// through the downloaded local database first (LocalPreferred) or as fallback
+// (online error/empty). LocalPreferred only matters when Local is non-nil.
 type Config struct {
 	Proxy  string
 	CACert string
+	Local  *LocalStore
+	// LocalPreferred: query the local store first and skip the network when it
+	// returns hits; false (default) keeps the network authoritative and only
+	// falls back to Local when the online lookup fails.
+	LocalPreferred bool
 }
 
 // Query is one lookup. Exactly one of CVEID / Keyword should be set; Keyword
@@ -65,9 +72,52 @@ type Result struct {
 }
 
 // Search runs one NVD lookup and compresses the response to Result. limit
-// defaults to 5, caps at 20. Network/parse failures return an error; the tool
-// layer turns that into a tool error result.
+// defaults to 5, caps at 20. With cfg.Local set, the local store participates:
+// LocalPreferred=true queries it first and skips the network on any hit; false
+// keeps the network authoritative and uses the local store only when the online
+// lookup fails (offline兜底). Network/parse failures surface as an error unless
+// the local store answered.
 func Search(ctx context.Context, cfg Config, q Query, limit int) (*Result, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if limit > 20 {
+		limit = 20
+	}
+	if cfg.Local != nil && cfg.LocalPreferred {
+		res, err := localSearch(ctx, cfg.Local, q, limit)
+		if err == nil && len(res.Matches) > 0 {
+			return res, nil // 本地命中即止：离线优先，不打网络
+		}
+		// 本地未命中（或出错）→ 继续走在线，兜底补新。
+	}
+	res, onlineErr := searchOnline(ctx, cfg, q, limit)
+	if onlineErr == nil {
+		return res, nil
+	}
+	// 在线失败且本地可用 → 本地兜底，note 标注数据来自本地快照。
+	if cfg.Local != nil {
+		if res, lerr := localSearch(ctx, cfg.Local, q, limit); lerr == nil && len(res.Matches) > 0 {
+			return res, nil
+		}
+	}
+	return nil, onlineErr
+}
+
+// localSearch wraps LocalStore.Search with the tool-level result shape.
+func localSearch(ctx context.Context, s *LocalStore, q Query, limit int) (*Result, error) {
+	query := q.Keyword
+	if strings.TrimSpace(q.CVEID) != "" && strings.TrimSpace(query) == "" {
+		query = strings.TrimSpace(q.CVEID)
+	}
+	if IsCVEID(query) {
+		query = strings.ToUpper(query)
+	}
+	return s.Search(ctx, query, limit)
+}
+
+// searchOnline is the previous Search body: one NVD API request.
+func searchOnline(ctx context.Context, cfg Config, q Query, limit int) (*Result, error) {
 	query := q.Keyword
 	if strings.TrimSpace(q.CVEID) != "" && strings.TrimSpace(q.Keyword) == "" {
 		query = strings.TrimSpace(q.CVEID)

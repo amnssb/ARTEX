@@ -188,3 +188,44 @@ func TestBestScoreFallbackChain(t *testing.T) {
 		t.Errorf("empty metrics: %v/%q", score, sev)
 	}
 }
+
+// Search 的本地/在线路由：LocalPreferred=true 时本地命中即不打网络；
+// LocalPreferred=false 时在线优先、在线挂了才兜底本地。
+func TestSearchLocalRouting(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.Upsert(ctx, sample("CVE-2024-5555", "local-only record for routing tests"), ""); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// 在线端：永远返回 503，用于验证兜底与本地优先。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	old := nvdEndpoint
+	nvdEndpoint = srv.URL
+	t.Cleanup(func() { nvdEndpoint = old })
+
+	cfg := Config{Local: s, LocalPreferred: true}
+	res, err := Search(ctx, cfg, Query{Keyword: "local-only"}, 5)
+	if err != nil || len(res.Matches) != 1 || res.Matches[0].ID != "CVE-2024-5555" {
+		t.Fatalf("local-preferred hit: %+v err=%v", res, err)
+	}
+	// note 应是本地库文案（说明数据来自快照）。
+	if !strings.Contains(res.Note, "本地") {
+		t.Errorf("note should mention local store: %q", res.Note)
+	}
+
+	// 本地优先 + 本地未命中 → 走在线 → 在线 503 → 无兜底可查 → 报错。
+	if _, err := Search(ctx, cfg, Query{Keyword: "not-in-local"}, 5); err == nil {
+		t.Fatal("miss on local + dead upstream must error")
+	}
+
+	// 非 localPreferred：在线失败 → 本地兜底。
+	cfg2 := Config{Local: s}
+	res2, err := Search(ctx, cfg2, Query{Keyword: "local-only"}, 5)
+	if err != nil || len(res2.Matches) != 1 {
+		t.Fatalf("fallback path: %+v err=%v", res2, err)
+	}
+}
